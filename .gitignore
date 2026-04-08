@@ -2,6 +2,8 @@
 **/__pycache__/
 **/.pytest_cache/
 .DS_Store
+.codex_index/
+TAGS
 
 *.pth
 *.pt
@@ -9,9 +11,11 @@
 checkpoints
 models
 
-libero_observations 
+libero_observations
 **.pid
 wandb/*
 **.log
+logs/
+artifacts/
 
 baselines/*
