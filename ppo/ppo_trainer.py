@@ -228,7 +228,7 @@ def collect_rollouts(
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
-        # Store transition
+        # Store rollout step record
         buffer.add(obs, action, reward, done, value, log_prob)
         
         # Track episode stats
@@ -689,4 +689,3 @@ if __name__ == "__main__":
             reward_shaper=args.reward_shaper,
             action_normalization=args.action_norm,
         )
-

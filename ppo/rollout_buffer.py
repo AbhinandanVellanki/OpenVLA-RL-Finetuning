@@ -45,7 +45,7 @@ class RolloutBuffer:
         log_prob: float,
     ):
         """
-        Add a transition to the buffer.
+        Add one rollout step record to the buffer.
         
         Args:
             obs: Observation
@@ -72,7 +72,7 @@ class RolloutBuffer:
         Compute returns and advantages using Generalized Advantage Estimation (GAE).
         
         Args:
-            last_value: Value estimate of the state after the last transition
+            last_value: Value estimate of the state after the last rollout step
             gamma: Discount factor
             gae_lambda: Lambda parameter for GAE
         """

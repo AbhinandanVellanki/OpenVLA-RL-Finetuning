@@ -143,7 +143,9 @@ class OpenVLAActor:
                     f"Proprio dimension {len(proprio)} is less than expected {self.cfg.proprio_dim}. "
                     f"Cannot pad - check observation processing."
                 )
-            proprio_tensor = torch.from_numpy(proprio).to(self.proprio_device, dtype=torch.float32)
+            # Keep proprio tensor on the same primary device as the actor unless
+            # an explicit multi-device path is introduced.
+            proprio_tensor = torch.from_numpy(proprio).to(self.device, dtype=torch.float32)
         elif proprio is not None:
             # Clip proprio even if no projector (for consistency)
             if len(proprio) > self.cfg.proprio_dim:
