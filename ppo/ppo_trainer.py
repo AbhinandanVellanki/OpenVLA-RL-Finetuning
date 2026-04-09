@@ -1,6 +1,10 @@
 """
 Example PPO training script using LIBERO environments.
 
+This file is a standalone template/example and is not the production training
+path used by this repository. The maintained OpenVLA PPO implementation lives
+in `OpenVLA_PPO.py`.
+
 This is a comprehensive template showing how to integrate LIBERO with RL training.
 Demonstrates all features of the libero_rl package:
 - Single and vectorized environments
