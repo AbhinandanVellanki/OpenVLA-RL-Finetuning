@@ -9,11 +9,12 @@ import torch
 from pathlib import Path
 import sys
 
-# Add paths
-vla_oft_path = Path(__file__).parent / "vla-oft"
-sys.path.insert(0, str(vla_oft_path))
+# Add repo root so repo-local packages resolve when running the file directly.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from min_vla.action_tokenizer import ActionTokenizer
+from vla_oft.min_vla.action_tokenizer import ActionTokenizer
 from ppo.trajectory_buffer import TrajectoryBuffer
 from ppo.core_algos import logprobs_from_logits, compute_policy_loss, apply_mask_with_grad_control
 
@@ -92,6 +93,7 @@ def test_trajectory_buffer():
                 pixel_values=pixel_values,
                 proprio=proprio,
                 action=action,
+                l1_action=action,  # Warmup-like sample with valid BC target
                 reward=reward,
                 done=done,
                 value=value,
@@ -124,8 +126,188 @@ def test_trajectory_buffer():
     
     assert len(data['observations']) == 80, "Wrong total steps!"
     assert (data['rewards'] != 0).sum() == 2, "Wrong number of non-zero rewards!"
+    assert data['bc_l1_actions'] is not None, "Expected BC-aligned L1 actions!"
+    assert len(data['bc_observations']) == len(data['bc_l1_actions']), "BC observations/targets misaligned!"
     
     print("✅ TrajectoryBuffer tests passed!")
+
+
+def test_trajectory_buffer_mixed_l1_hardening():
+    """Test buffer hardening with mixed valid/None/invalid L1 action entries."""
+    print("\n" + "="*70)
+    print("Testing TrajectoryBuffer L1 hardening")
+    print("="*70)
+
+    buffer = TrajectoryBuffer()
+
+    for step in range(4):
+        obs = {"image": np.zeros((224, 224, 3), dtype=np.uint8), "proprio": np.zeros(8)}
+        responses = torch.randint(31744, 32000, (56,))
+        input_ids = torch.randint(0, 32000, (1, 40))
+        attention_mask = torch.ones((1, 40))
+        pixel_values = torch.randn((1, 3, 224, 224))
+        proprio = np.zeros(8)
+        action = np.random.uniform(-1, 1, (8, 7))
+
+        if step == 0:
+            l1_action = action.copy()  # valid
+        elif step == 1:
+            l1_action = None  # missing
+        elif step == 2:
+            l1_action = action.copy().reshape(-1)  # wrong shape but same size (reshapable)
+        else:
+            l1_action = np.random.uniform(-1, 1, (7,))  # invalid shape/size (dropped)
+
+        done = (step == 3)
+        reward = 1.0 if done else 0.0
+
+        buffer.add(
+            obs=obs,
+            responses=responses,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            proprio=proprio,
+            action=action,
+            l1_action=l1_action,
+            reward=reward,
+            done=done,
+            value=0.0,
+            old_log_prob=torch.tensor(-2.0),
+        )
+
+    buffer.compute_advantages()
+    data = buffer.get()
+
+    print(f"  - Total samples: {len(data['observations'])}")
+    print(f"  - Valid BC samples: {0 if data['bc_l1_actions'] is None else len(data['bc_l1_actions'])}")
+    print(f"  - L1 valid mask sum: {int(data['l1_actions_mask'].sum())}")
+
+    assert len(data['observations']) == 4
+    assert data['l1_actions_mask'].shape[0] == 4
+    assert data['bc_l1_actions'] is not None
+    assert len(data['bc_observations']) == len(data['bc_l1_actions'])
+    assert len(data['bc_l1_actions']) == int(data['l1_actions_mask'].sum())
+
+    print("✅ TrajectoryBuffer hardening tests passed!")
+
+
+def test_trajectory_buffer_partial_chunk_metadata():
+    """Test explicit metadata for terminal partial chunks."""
+    print("\n" + "="*70)
+    print("Testing TrajectoryBuffer partial chunk metadata")
+    print("="*70)
+
+    buffer = TrajectoryBuffer()
+
+    full_action = np.random.uniform(-1, 1, (8, 7))
+    partial_action = np.random.uniform(-1, 1, (8, 7))
+
+    common_kwargs = {
+        "obs": {"image": np.zeros((224, 224, 3), dtype=np.uint8), "proprio": np.zeros(8)},
+        "input_ids": torch.randint(0, 32000, (1, 32)),
+        "attention_mask": torch.ones((1, 32)),
+        "pixel_values": torch.randn((1, 3, 224, 224)),
+        "proprio": np.zeros(8),
+        "value": 0.0,
+    }
+
+    buffer.add(
+        responses=torch.randint(31744, 32000, (56,)),
+        action=full_action,
+        l1_action=full_action.copy(),
+        reward=0.0,
+        done=True,
+        old_log_prob=torch.tensor(-1.5),
+        response_mask=torch.ones(56, dtype=torch.bool),
+        action_mask=np.ones(8, dtype=bool),
+        executed_action_count=8,
+        executed_token_count=56,
+        chunk_is_partial=False,
+        **common_kwargs,
+    )
+
+    partial_response_mask = torch.zeros(56, dtype=torch.bool)
+    partial_response_mask[:21] = True
+    partial_action_mask = np.zeros(8, dtype=bool)
+    partial_action_mask[:3] = True
+    buffer.add(
+        responses=torch.randint(31744, 32000, (56,)),
+        action=partial_action,
+        l1_action=partial_action.copy(),
+        reward=1.0,
+        done=True,
+        old_log_prob=torch.tensor(-0.7),
+        response_mask=partial_response_mask,
+        action_mask=partial_action_mask,
+        executed_action_count=3,
+        executed_token_count=21,
+        chunk_is_partial=True,
+        **common_kwargs,
+    )
+
+    buffer.compute_advantages()
+    data = buffer.get()
+
+    assert data["response_masks"].shape == data["responses"].shape
+    assert data["action_masks"].shape == (2, 8)
+    assert np.array_equal(data["executed_action_counts"], np.array([8, 3], dtype=np.int32))
+    assert np.array_equal(data["executed_token_counts"], np.array([56, 21], dtype=np.int32))
+    assert np.array_equal(data["chunk_is_partial"], np.array([False, True]))
+    assert int(data["response_masks"][1].sum().item()) == 21
+    assert int(data["action_masks"][1].sum()) == 3
+    assert data["advantages"].shape[0] == 2
+    assert data["advantages"][1] == 1.0
+
+    print("✅ Partial chunk metadata tests passed!")
+
+
+def test_trajectory_buffer_bc_views_preserve_partial_masks():
+    """Test BC-aligned views keep per-sample partial-chunk masks."""
+    print("\n" + "="*70)
+    print("Testing BC-aligned partial chunk masks")
+    print("="*70)
+
+    buffer = TrajectoryBuffer()
+    action = np.random.uniform(-1, 1, (8, 7))
+    response_mask = torch.zeros(56, dtype=torch.bool)
+    response_mask[:28] = True
+    action_mask = np.zeros(8, dtype=bool)
+    action_mask[:4] = True
+
+    buffer.add(
+        obs={"image": np.zeros((224, 224, 3), dtype=np.uint8), "proprio": np.zeros(8)},
+        responses=torch.randint(31744, 32000, (56,)),
+        input_ids=torch.randint(0, 32000, (1, 24)),
+        attention_mask=torch.ones((1, 24)),
+        pixel_values=torch.randn((1, 3, 224, 224)),
+        proprio=np.zeros(8),
+        action=action,
+        l1_action=action.copy(),
+        reward=1.0,
+        done=True,
+        value=0.0,
+        old_log_prob=torch.tensor(-1.0),
+        response_mask=response_mask,
+        action_mask=action_mask,
+        executed_action_count=4,
+        executed_token_count=28,
+        chunk_is_partial=True,
+    )
+
+    buffer.compute_advantages()
+    data = buffer.get()
+
+    assert data["bc_l1_actions"] is not None
+    assert data["bc_action_masks"] is not None
+    assert isinstance(data["bc_response_masks"], torch.Tensor)
+    assert data["bc_l1_actions"].shape == (1, 8, 7)
+    assert data["bc_action_masks"].shape == (1, 8)
+    assert data["bc_response_masks"].shape == (1, 56)
+    assert int(data["bc_action_masks"][0].sum()) == 4
+    assert int(data["bc_response_masks"][0].sum().item()) == 28
+
+    print("✅ BC-aligned partial mask tests passed!")
 
 
 def test_ppo_algorithms():
@@ -188,6 +370,9 @@ def main():
     try:
         test_action_tokenizer()
         test_trajectory_buffer()
+        test_trajectory_buffer_mixed_l1_hardening()
+        test_trajectory_buffer_partial_chunk_metadata()
+        test_trajectory_buffer_bc_views_preserve_partial_masks()
         test_ppo_algorithms()
         
         print("\n" + "="*70)

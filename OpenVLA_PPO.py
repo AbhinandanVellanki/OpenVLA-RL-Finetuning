@@ -1,8 +1,11 @@
 """
 OpenVLA PPO Training for LIBERO Spatial Tasks
 
-Integrates OpenVLA actor with PPO for policy fine-tuning in LIBERO environments.
-Adds a lightweight value head critic for advantage estimation.
+Production OpenVLA training entrypoint for LIBERO experiments.
+
+Implements a two-stage pipeline:
+- BC warmup to train the tokenized action-chunk head against L1 actions
+- Value-free clipped policy optimization in RL using sparse success rewards
 
 Usage:
     # Single task training (quick test)
@@ -17,10 +20,11 @@ Usage:
 import argparse
 import os
 import sys
+import random
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 import torch
@@ -51,6 +55,15 @@ from libero_rl.utils.action_utils import process_action_for_libero, get_dummy_ac
 from libero_rl.utils.task_utils import get_task, get_max_episode_length, get_all_task_names
 
 
+def set_global_seed(seed: int) -> None:
+    """Set Python/NumPy/PyTorch seeds for best-effort reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 class OpenVLAPPO:
     """
     PPO trainer for OpenVLA actor using GRPO (value-free advantages).
@@ -79,7 +92,7 @@ class OpenVLAPPO:
         # Set default CUDA device
         if self.device.type == 'cuda':
             torch.cuda.set_device(self.device)
-            print(f"✓ Set default CUDA device to {self.device}")
+            print(f" Set default CUDA device to {self.device}")
         
         print(f"Device: {self.device}")
         
@@ -92,9 +105,16 @@ class OpenVLAPPO:
             self.actor.vla.language_model.gradient_checkpointing_enable()
             print("Enabled gradient checkpointing for memory efficiency")
         
-        # Training stage tracking
-        self.training_stage = "warmup"  # "warmup", "transition", or "rl"
+        # Training stage tracking (stage is locked for each rollout+update cycle)
+        self.training_stage = "warmup" if (self.cfg.use_l1_warmstart and self.cfg.l1_warmup_steps > 0) else "rl"
         self.stage_step = 0  # Steps within current stage
+        self.stage_change_reason = "init"
+
+        # Warmup competence gate state (used to decide warmup -> rl handoff).
+        warmup_window = max(1, self.cfg.l1_warmup_success_window)
+        self.warmup_tokenized_success_history = deque(maxlen=warmup_window)
+        self.warmup_gate_consecutive_hits = 0
+        self.warmup_gate_last_rolling_success = None
         
         # Initialize action tokenizer
         print("Initializing action tokenizer...")
@@ -114,9 +134,9 @@ class OpenVLAPPO:
         
         # Verify VLA has norm_stats loaded (done automatically in get_vla())
         if hasattr(vla_model, 'norm_stats') and vla_model.norm_stats is not None:
-            print(f"✓ VLA norm_stats loaded: {list(vla_model.norm_stats.keys())}")
+            print(f" VLA norm_stats loaded: {list(vla_model.norm_stats.keys())}")
         else:
-            print("⚠ Warning: VLA norm_stats not loaded, unnormalization may fail")
+            print(" Warning: VLA norm_stats not loaded, unnormalization may fail")
         
         # Store unnorm_key for validation
         self.unnorm_key = "libero_spatial_no_noops"
@@ -162,7 +182,7 @@ class OpenVLAPPO:
         # Wrap in DataParallel if enabled (MUST be done AFTER LoRA)
         if vla_config.use_data_parallel and torch.cuda.device_count() > 1:
             print(f"\n{'='*70}")
-            print(f"🚀 Enabling DataParallel on {torch.cuda.device_count()} GPUs")
+            print(f" Enabling DataParallel on {torch.cuda.device_count()} GPUs")
             print(f"{'='*70}")
             
             # Wrap VLA backbone in DataParallel
@@ -177,7 +197,7 @@ class OpenVLAPPO:
             print(f"✓ Output gathered on: {self.device}")
             print(f"{'='*70}\n")
         elif vla_config.use_data_parallel and torch.cuda.device_count() <= 1:
-            print(f"⚠️  DataParallel enabled but only {torch.cuda.device_count()} GPU(s) available")
+            print(f"  DataParallel enabled but only {torch.cuda.device_count()} GPU(s) available")
             print(f"   Running on single GPU: {self.device}")
         
         # Apply freezing strategy based on configuration
@@ -235,7 +255,7 @@ class OpenVLAPPO:
         # FREEZE VLA BACKBONE if configured
         if vla_config.freeze_vla_backbone:
             print("\n" + "="*70)
-            print("🔒 Freezing Base VLA Backbone (LoRA adapters trainable)")
+            print(" Freezing Base VLA Backbone (LoRA adapters trainable)")
             print("="*70)
             
             # Get unwrapped model for freezing (in case of DataParallel)
@@ -255,13 +275,13 @@ class OpenVLAPPO:
             trainable = sum(p.numel() for p in vla_model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in vla_model.parameters())
             
-            print(f"✓ Frozen base backbone (7B parameters)")
-            print(f"✓ LoRA adapters trainable: {trainable:,} parameters")
-            print(f"✓ Trainable: {100*trainable/total:.2f}%")
+            print(f" Frozen base backbone (7B parameters)")
+            print(f" LoRA adapters trainable: {trainable:,} parameters")
+            print(f" Trainable: {100*trainable/total:.2f}%")
             print("="*70 + "\n")
             
             # Debug: Show what's actually trainable
-            print("\n📊 Trainable Parameter Breakdown:")
+            print("\n Trainable Parameter Breakdown:")
             lora_params = []
             backbone_params = []
             other_params = []
@@ -275,21 +295,21 @@ class OpenVLAPPO:
                     else:
                         other_params.append((name, param.numel()))
             
-            print(f"\n✓ Trainable LoRA parameters: {len(lora_params)}")
+            print(f"\n Trainable LoRA parameters: {len(lora_params)}")
             if lora_params[:3]:  # Show first 3
                 for n, s in lora_params[:3]:
                     print(f"  - {n}: {s:,} params")
                 if len(lora_params) > 3:
                     print(f"  - ... and {len(lora_params) - 3} more")
             
-            print(f"\n✓ Trainable backbone parameters: {len(backbone_params)}")
+            print(f"\n Trainable backbone parameters: {len(backbone_params)}")
             if backbone_params[:3]:
                 for n, s in backbone_params[:3]:
                     print(f"  - {n}: {s:,} params")
             elif len(backbone_params) == 0:
                 print(f"  - None (all frozen ✓)")
             
-            print(f"\n✓ Other trainable parameters: {len(other_params)}")
+            print(f"\n Other trainable parameters: {len(other_params)}")
             if other_params:
                 for n, s in other_params:
                     print(f"  - {n}: {s:,} params")
@@ -297,7 +317,7 @@ class OpenVLAPPO:
             total_lora = sum(s for _, s in lora_params)
             total_backbone = sum(s for _, s in backbone_params)
             total_other = sum(s for _, s in other_params)
-            print(f"\n📈 Total trainable in VLA: {total_lora + total_backbone + total_other:,}")
+            print(f"\n Total trainable in VLA: {total_lora + total_backbone + total_other:,}")
             if total_lora + total_backbone + total_other > 0:
                 print(f"  - LoRA: {total_lora:,} ({100*total_lora/(total_lora+total_backbone+total_other):.1f}%)")
                 print(f"  - Backbone: {total_backbone:,} ({100*total_backbone/(total_lora+total_backbone+total_other):.1f}%)")
@@ -326,7 +346,7 @@ class OpenVLAPPO:
         trainable_total = sum(p.numel() for p in actor_params if p.requires_grad)
         total = sum(p.numel() for p in self.actor.vla.parameters())
         
-        print(f"\n📊 Final Optimizer Parameters:")
+        print(f"\n Final Optimizer Parameters:")
         print(f"   VLA trainable: {trainable_vla:,}")
         print(f"   Proprio projector: {trainable_proprio:,}")
         print(f"   Total trainable: {trainable_total:,} / {total:,} ({100*trainable_total/total:.2f}%)")
@@ -358,6 +378,13 @@ class OpenVLAPPO:
         # Checkpoint tracking
         self.best_success_rate = 0.0
         self.best_checkpoint_path = None
+        self.stage_best_success_rates = {
+            "warmup": 0.0,
+            "rl": 0.0,
+        }
+        self.stage_best_checkpoint_paths = {}
+        self.stage_latest_checkpoint_paths = {}
+        self.zero_success_rollout_streak = 0
         self.update_count = 0  # Track number of policy updates
         
         # Multi-task tracking
@@ -382,8 +409,9 @@ class OpenVLAPPO:
         
         # Important: Confirm action head configuration for training
         if self.actor.l1_action_head:
-            print(f"\n✓ Training will use L1 action head (same as validation) for rollouts")
-            print(f"  This ensures consistent 80% success rate during training!")
+            print(f"\n Stage policy setup:")
+            print(f"  - Warmup stage rollouts use L1 action head")
+            print(f"  - RL stage rollouts use tokenized policy")
     
     @property
     def vla_unwrapped(self):
@@ -635,6 +663,7 @@ class OpenVLAPPO:
         # Compile info dictionary
         info = {
             'log_prob': log_prob[0],  # Scalar tensor
+            'token_log_probs': log_probs_per_token[0],  # Per-token log probs for partial-chunk masking
             'responses': torch.from_numpy(discretized).to(self.device),  # Tokenized L1 actions
             'input_ids': inputs['input_ids'],
             'attention_mask': inputs['attention_mask'],
@@ -675,6 +704,7 @@ class OpenVLAPPO:
         # Compile info dictionary
         info = {
             'log_prob': action_data['log_prob'],
+            'token_log_probs': action_data['token_log_probs'],
             'responses': action_data['responses'],
             'input_ids': action_data['input_ids'],
             'attention_mask': action_data['attention_mask'],
@@ -712,9 +742,10 @@ class OpenVLAPPO:
         
         Returns:
             Dictionary containing:
-                - logits: Action token logits, shape (action_dim * action_chunk, 256)
+                - logits: Temperature-scaled policy logits, shape (action_dim * action_chunk, 256)
+                - raw_logits: Raw model logits before temperature scaling
                 - responses: Sampled token IDs, shape (action_dim * action_chunk,)
-                - log_prob: Log probability tensor (sum over action dims)
+                - log_prob: Log probability tensor under the tempered policy
                 - continuous_action: Detokenized action, shape (action_dim,)
                 - input_ids, attention_mask, pixel_values: For replay
         """
@@ -842,27 +873,26 @@ class OpenVLAPPO:
         # Extract last 256 tokens (action vocabulary)
         # FIXED: Should be [-256:] not [-256-64:-64] to get tokens 31744-32000
         action_token_logits = action_logits[..., -256:]  # Shape: (batch, seq_len, 256)
-        
+        policy_logits = self._apply_policy_temperature(action_token_logits, temperature)
+
         # Sample or take argmax (greedy)
         if sample and temperature > 0:
-            # Apply temperature and sample
-            scaled_logits = action_token_logits / temperature
-            probs = torch.softmax(scaled_logits, dim=-1)
+            probs = torch.softmax(policy_logits, dim=-1)
             
             # Sample token indices [0, 255]
             probs_flat = probs.reshape(-1, probs.shape[-1])
             sampled_indices_flat = torch.multinomial(probs_flat, num_samples=1)
-            sampled_indices = sampled_indices_flat.view(action_token_logits.shape[0], -1)
+            sampled_indices = sampled_indices_flat.view(policy_logits.shape[0], -1)
             
             # Convert to vocab token IDs (last 256 tokens)
             responses = sampled_indices + (self.action_tokenizer.vocab_size - 256)
         else:
             # Greedy decoding (argmax) - matches reference eval (modeling_prismatic.py line 936)
-            sampled_indices = action_token_logits.argmax(dim=-1)
+            sampled_indices = policy_logits.argmax(dim=-1)
             responses = sampled_indices + (self.action_tokenizer.vocab_size - 256)
         
-        # Compute log probabilities
-        log_probs_per_token = logprobs_from_logits(action_token_logits, sampled_indices)
+        # Compute log probabilities under the tempered rollout/update policy.
+        log_probs_per_token = logprobs_from_logits(policy_logits, sampled_indices)
         # CRITICAL: Use mean instead of sum to normalize by sequence length (256 tokens)
         # This prevents massive log prob values (-500 to -800) that cause gradient explosions
         log_prob = log_probs_per_token.mean(dim=-1)  # Mean over action dimensions
@@ -876,84 +906,246 @@ class OpenVLAPPO:
         continuous_actions = continuous_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)  # (8, 7)
         
         return {
-            'logits': action_token_logits,
+            'logits': policy_logits,
+            'raw_logits': action_token_logits,
             'responses': responses[0],  # (action_dim * action_chunk,)
             'log_prob': log_prob[0],  # Scalar tensor
+            'token_log_probs': log_probs_per_token[0],  # (action_dim * action_chunk,)
             'continuous_actions': continuous_actions,  # (8, 7) - all 8 actions
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'pixel_values': pixel_values,
         }
-    
-    def _should_use_l1_actions(self) -> bool:
+
+    @staticmethod
+    def _apply_policy_temperature(
+        logits: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
         """
-        Determine whether to use L1 or tokenized actions for rollouts based on training phase.
+        Apply sampling temperature to policy logits.
+
+        In RL we treat temperature as part of the policy family being optimized,
+        so rollout sampling, old log-probs, and new log-probs must all use the
+        same temperature-scaled logits.
+        """
+        if temperature <= 0:
+            # Greedy/argmax decoding path: temperature scaling is irrelevant.
+            return logits
+        if np.isclose(float(temperature), 1.0):
+            return logits
+        return logits / float(temperature)
+
+    @staticmethod
+    def _masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """Compute the mean over the valid token positions only."""
+        values = values.reshape(-1)
+        mask = mask.reshape(-1).to(device=values.device, dtype=torch.bool)
+        if values.numel() != mask.numel():
+            raise ValueError(
+                f"Masked token mean expects aligned tensors, got {values.numel()} values "
+                f"and {mask.numel()} mask entries."
+            )
+        valid_count = int(mask.sum().item())
+        if valid_count <= 0:
+            return values.new_zeros(()), 0
+        return values[mask].mean(), valid_count
+
+    @staticmethod
+    def _build_execution_masks(
+        responses: torch.Tensor,
+        action: np.ndarray,
+        executed_action_count: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, np.ndarray, int, int, bool]:
+        """
+        Build explicit executed-action and executed-token masks for a rollout sample.
+
+        Returns:
+            response_mask: bool tensor matching `responses`
+            action_mask: bool array matching first action dimension
+            executed_action_count: clamped executed action count
+            executed_token_count: valid executed token count
+            chunk_is_partial: True when the sample ended before all actions executed
+        """
+        action_arr = np.asarray(action)
+        action_slots = action_arr.shape[0] if action_arr.ndim >= 2 else 1
+        if executed_action_count is None:
+            executed_action_count = action_slots
+        executed_action_count = max(0, min(int(executed_action_count), action_slots))
+
+        action_mask = np.zeros(action_slots, dtype=bool)
+        action_mask[:executed_action_count] = True
+
+        responses = responses.reshape(-1)
+        response_mask = torch.zeros_like(responses, dtype=torch.bool)
+        total_tokens = int(responses.numel())
+        if total_tokens == 0:
+            return response_mask, action_mask, executed_action_count, 0, bool(executed_action_count < action_slots)
+
+        if total_tokens % action_slots != 0:
+            if executed_action_count != action_slots:
+                raise ValueError(
+                    "Cannot infer partial-chunk token mask because token count "
+                    f"{total_tokens} is not divisible by action slots {action_slots}."
+                )
+            executed_token_count = total_tokens
+        else:
+            tokens_per_action = total_tokens // action_slots
+            executed_token_count = executed_action_count * tokens_per_action
+
+        response_mask[:executed_token_count] = True
+        chunk_is_partial = executed_action_count < action_slots
+        return response_mask, action_mask, executed_action_count, executed_token_count, chunk_is_partial
+    
+    def _should_use_l1_actions(self, stage: str) -> bool:
+        """
+        Determine whether rollouts should execute L1 actions for a locked stage.
         
-        Training phases:
-        1. Warmup (0 to l1_warmup_steps): Use L1 actions (behavior cloning)
-        2. Transition (warmup to warmup+transition): Epsilon-greedy mixing
-        3. RL (after transition): Use tokenized actions (true PPO)
+        Args:
+            stage: Locked stage for the current rollout+update cycle ("warmup" or "rl")
         
         Returns:
-            True if should use L1 actions, False if should use tokenized actions
+            True only for warmup when warmstart is enabled.
+        """
+        return self.cfg.use_l1_warmstart and stage == "warmup"
+    
+    def _update_warmup_gate(self, tokenized_success_rate: float):
+        """
+        Update rolling warmup competence stats using latest tokenized validation success.
         """
         if not self.cfg.use_l1_warmstart:
-            return False  # Warmstart disabled, always use tokenized
-        
+            return
+
+        self.warmup_tokenized_success_history.append(float(tokenized_success_rate))
+        self.warmup_gate_last_rolling_success = float(np.mean(self.warmup_tokenized_success_history))
+
+        # Enforce min warmup step gate before counting consecutive competence hits.
         if self.global_step < self.cfg.l1_warmup_steps:
-            return True  # Warmup phase: use L1
-        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-            # Transition phase: epsilon-greedy
-            progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
-            epsilon = 1.0 - progress  # 1.0 → 0.0 over transition period
-            return np.random.rand() < epsilon
+            self.warmup_gate_consecutive_hits = 0
+            return
+
+        window = max(1, self.cfg.l1_warmup_success_window)
+        if len(self.warmup_tokenized_success_history) < window:
+            self.warmup_gate_consecutive_hits = 0
+            return
+
+        threshold = self.cfg.l1_warmup_success_threshold
+        if self.warmup_gate_last_rolling_success >= threshold:
+            self.warmup_gate_consecutive_hits += 1
         else:
-            return False  # RL phase: use tokenized
-    
-    def _get_training_stage(self) -> str:
+            self.warmup_gate_consecutive_hits = 0
+
+    def _should_exit_warmup(self, step: Optional[int] = None) -> Tuple[bool, str]:
         """
-        Determine current training stage based on global_step.
+        Decide if warmup should hand off to RL.
+        
+        Decision order:
+        1) min warmup steps must be met
+        2) optional max warmup cap
+        3) optional overclone guard
+        4) competence gate (rolling success threshold for consecutive validations)
+        """
+        if step is None:
+            step = self.global_step
+
+        min_steps = max(0, self.cfg.l1_warmup_steps)
+        if step < min_steps:
+            return False, f"min_warmup_not_met({step}/{min_steps})"
+
+        max_steps = self.cfg.l1_warmup_max_steps
+        if max_steps > 0 and step >= max_steps:
+            return True, f"max_warmup_steps({step}>={max_steps})"
+
+        rolling = self.warmup_gate_last_rolling_success
+        overclone_threshold = self.cfg.l1_warmup_overclone_threshold
+        if rolling is not None and overclone_threshold <= 1.0 and rolling >= overclone_threshold:
+            return True, (
+                f"overclone_guard(rolling={rolling:.3f}, threshold={overclone_threshold:.3f})"
+            )
+
+        required_hits = max(1, self.cfg.l1_warmup_required_consecutive)
+        if self.warmup_gate_consecutive_hits >= required_hits:
+            threshold = self.cfg.l1_warmup_success_threshold
+            rolling_text = "n/a" if rolling is None else f"{rolling:.3f}"
+            return True, (
+                "competence_gate("
+                f"rolling={rolling_text}, threshold={threshold:.3f}, "
+                f"hits={self.warmup_gate_consecutive_hits}/{required_hits})"
+            )
+
+        threshold = self.cfg.l1_warmup_success_threshold
+        rolling_text = "n/a" if rolling is None else f"{rolling:.3f}"
+        return False, (
+            "competence_pending("
+            f"rolling={rolling_text}, threshold={threshold:.3f}, "
+            f"hits={self.warmup_gate_consecutive_hits}/{required_hits})"
+        )
+
+    def _determine_training_stage(self, step: Optional[int] = None) -> Tuple[str, str]:
+        """
+        Determine stage and reason from current step and warmup gate state.
+        """
+        if step is None:
+            step = self.global_step
+
+        if not self.cfg.use_l1_warmstart:
+            return "rl", "warmstart_disabled"
+
+        # Never regress back to warmup once RL starts.
+        if self.training_stage == "rl":
+            return "rl", "rl_locked"
+
+        should_exit, reason = self._should_exit_warmup(step=step)
+        if should_exit:
+            return "rl", reason
+        return "warmup", reason
+
+    def _get_training_stage(self, step: Optional[int] = None) -> str:
+        """
+        Determine training stage from step count + warmup gate.
+        
+        Stages:
+        1. Warmup: execute L1 rollouts + BC updates
+        2. RL: execute tokenized rollouts + PPO updates
         
         Returns:
-            "warmup", "transition", or "rl"
+            "warmup" or "rl"
         """
-        if not self.cfg.use_l1_warmstart:
-            return "rl"
-        
-        if self.global_step < self.cfg.l1_warmup_steps:
-            return "warmup"
-        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-            return "transition"
-        else:
-            return "rl"
+        stage, _ = self._determine_training_stage(step=step)
+        return stage
     
-    def _update_training_stage(self):
+    def _update_training_stage(self) -> str:
         """
-        Update training stage and log transition if stage changed.
+        Update training stage and log stage change if stage changed.
         """
-        new_stage = self._get_training_stage()
+        new_stage, stage_change_reason = self._determine_training_stage(step=self.global_step)
+        self.stage_change_reason = stage_change_reason
         if new_stage != self.training_stage:
             old_stage = self.training_stage
             self.training_stage = new_stage
             self.stage_step = 0
             
-            # Log stage transition
+            # Log stage change
             print(f"\n{'='*70}")
-            print(f"🔄 STAGE TRANSITION: {old_stage.upper()} → {new_stage.upper()}")
+            print(f" STAGE CHANGE: {old_stage.upper()} → {new_stage.upper()}")
             print(f"   Global Step: {self.global_step}")
+            print(f"   Reason: {stage_change_reason}")
             print(f"{'='*70}\n")
             
             if self.cfg.use_wandb:
                 try:
                     wandb.log({
-                        "stage/transition": 1,
+                        "stage/change_event": 1,
                         "stage/name": new_stage,
-                        "stage/transition_step": self.global_step,
+                        "stage/change_step": self.global_step,
+                        "stage/reason": stage_change_reason,
                     }, step=self.global_step)
                 except Exception as e:
-                    print(f"⚠️  WARNING: Failed to log stage transition: {e}")
+                    print(f"  WARNING: Failed to log stage change: {e}")
         else:
             self.stage_step += 1
+        
+        return self.training_stage
     
     def _discretize_l1_actions(self, l1_actions: np.ndarray) -> torch.Tensor:
         """
@@ -999,18 +1191,28 @@ class OpenVLAPPO:
         if len(data['observations']) == 0:
             return {"train/no_data": 1.0}
         
-        # Extract L1 actions (these are the ground truth targets)
-        # l1_actions should be stored in the buffer during rollout
-        if 'l1_actions' not in data:
-            print("⚠️  WARNING: No L1 actions in buffer! Cannot perform BC update.")
-            print("    Falling back to PPO update...")
-            # Fall back to regular PPO (will implement after this works)
+        # Extract BC-aligned L1 targets (robust to mixed/invalid L1 samples).
+        bc_observations = data.get("bc_observations", data["observations"])
+        l1_actions = data.get("bc_l1_actions", data.get("l1_actions"))
+        bc_response_masks = data.get("bc_response_masks")
+        if l1_actions is None or len(l1_actions) == 0:
+            print("  WARNING: No valid L1 actions in buffer! Cannot perform BC update.")
             return {"train/no_l1_data": 1.0}
-        
-        l1_actions = data['l1_actions']  # List of (action_dim,) arrays
+
+        if len(bc_observations) != len(l1_actions):
+            min_samples = min(len(bc_observations), len(l1_actions))
+            print(
+                "  WARNING: BC observation/target mismatch detected "
+                f"({len(bc_observations)} vs {len(l1_actions)}). "
+                f"Truncating to {min_samples} samples."
+            )
+            bc_observations = bc_observations[:min_samples]
+            l1_actions = l1_actions[:min_samples]
+            if isinstance(bc_response_masks, torch.Tensor):
+                bc_response_masks = bc_response_masks[:min_samples]
         
         print(f"\n{'='*70}")
-        print(f"🎯 BEHAVIOR CLONING UPDATE (Warmup Phase)")
+        print(f" BEHAVIOR CLONING UPDATE (Warmup Phase)")
         print(f"   Training tokenized head to match L1 actions")
         print(f"   Samples: {len(l1_actions)}")
         print(f"{'='*70}\n")
@@ -1060,8 +1262,11 @@ class OpenVLAPPO:
                 
                 # Process each sample in minibatch
                 for i, idx in enumerate(mb_indices):
-                    obs = data["observations"][idx.item()]
+                    obs = bc_observations[idx.item()]
                     l1_actions_chunk = l1_actions[idx.item()]  # Full chunk (8, 7)
+                    response_mask = None
+                    if isinstance(bc_response_masks, torch.Tensor) and len(bc_response_masks) > idx.item():
+                        response_mask = bc_response_masks[idx.item()].to(self.training_device, dtype=torch.bool)
 
                     # Convert L1 actions chunk to target token IDs
                     # Flatten to (56,) then discretize
@@ -1086,10 +1291,19 @@ class OpenVLAPPO:
                     # Map target tokens to indices in [0, 255]
                     target_indices = target_tokens - (self.action_tokenizer.vocab_size - 256)
                     target_indices = target_indices.clamp(0, 255)  # Safety clamp
+                    if response_mask is None:
+                        response_mask = torch.ones_like(target_indices, dtype=torch.bool, device=self.training_device)
+                    valid_token_count = int(response_mask.sum().item())
+                    if valid_token_count <= 0:
+                        print(f"\n  WARNING: No valid BC tokens at sample {i}! Skipping sample.")
+                        del action_data
+                        continue
+                    valid_logits = logits_full[response_mask]
+                    valid_targets = target_indices[response_mask]
 
                     # Cross-entropy loss: train all 8 actions at once
-                    # logits: (56, 256), targets: (56,)
-                    bc_loss = nn.functional.cross_entropy(logits_full, target_indices, reduction='mean')
+                    # logits: (valid_tokens, 256), targets: (valid_tokens,)
+                    bc_loss = nn.functional.cross_entropy(valid_logits, valid_targets, reduction='mean')
 
                     # Normalize by batch size for gradient accumulation
                     (bc_loss / len(mb_indices)).backward()
@@ -1097,7 +1311,7 @@ class OpenVLAPPO:
                     # Compute accuracy (percentage of correctly predicted bins across all 8 actions)
                     with torch.no_grad():
                         pred_indices = logits_full.argmax(dim=-1)
-                        accuracy = (pred_indices == target_indices).float().mean()
+                        accuracy = (pred_indices[response_mask] == valid_targets).float().mean()
                         total_accuracy += accuracy.item()
 
                     total_bc_loss += bc_loss.item()
@@ -1119,7 +1333,7 @@ class OpenVLAPPO:
                         break
                 
                 if has_nan_grad:
-                    print(f"\n⚠️  WARNING: NaN or inf detected in gradients! Skipping optimizer step.")
+                    print(f"\n  WARNING: NaN or inf detected in gradients! Skipping optimizer step.")
                     self.actor_optimizer.zero_grad()
                     continue
                 
@@ -1127,7 +1341,7 @@ class OpenVLAPPO:
                 total_norm = torch.nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
                 
                 if total_norm > self.max_grad_norm * 1000:
-                    print(f"\n⚠️  CRITICAL: Gradient explosion: {total_norm:.2f}")
+                    print(f"\n  CRITICAL: Gradient explosion: {total_norm:.2f}")
                     self.actor_optimizer.zero_grad()
                     continue
                 
@@ -1179,7 +1393,7 @@ class OpenVLAPPO:
             'train/bc_entropy': np.mean(stats['train/bc_entropy']) if stats['train/bc_entropy'] else float('nan'),
         }
         
-        print(f"\n✓ BC update complete:")
+        print(f"\n BC update complete:")
         print(f"   Loss: {aggregated_stats['train/bc_loss']:.6f}")
         print(f"   Accuracy: {aggregated_stats['train/bc_accuracy']:.4f}")
         print(f"   BC Entropy: {aggregated_stats['train/bc_entropy']:.4f}")
@@ -1190,28 +1404,22 @@ class OpenVLAPPO:
         
         return aggregated_stats
     
-    def _get_rollout_policy_name(self) -> str:
+    def _get_rollout_policy_name(self, stage: str) -> str:
         """
         Get human-readable name of current rollout policy for logging.
         
         Returns:
             String describing current policy (e.g., "L1 (warmup)", "Tokenized (RL)")
         """
-        if not self.cfg.use_l1_warmstart:
-            return "Tokenized (RL)"
-        
-        if self.global_step < self.cfg.l1_warmup_steps:
+        if self._should_use_l1_actions(stage):
             return "L1 (warmup)"
-        elif self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-            progress = (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps
-            return f"L1→Tokenized ({progress:.0%})"
-        else:
-            return "Tokenized (RL)"
+        return "Tokenized (RL)"
     
     def collect_rollouts(
         self,
         env,
         task_prompts: Union[str, List[str]],
+        stage: str,
     ) -> Dict[str, float]:
         """
         Collect trajectory-based rollouts with sparse rewards.
@@ -1219,14 +1427,14 @@ class OpenVLAPPO:
         Collects complete episodes, assigns sparse rewards only at episode completion,
         and stores action token IDs for PPO training.
         
-        Implements phased training:
-        1. Warmup: Execute L1 actions, train tokenized to match (behavior cloning)
-        2. Transition: Gradually shift to tokenized actions (epsilon-greedy)
-        3. RL: Execute tokenized actions, train with true PPO
+        Uses stage-locked policy selection for clean boundaries:
+        1. Warmup: Execute L1 actions for the full rollout update
+        2. RL: Execute tokenized actions for the full rollout update
         
         Args:
             env: Single or vectorized LIBERO environment
             task_prompts: Single task prompt string or list of prompts (one per env)
+            stage: Locked stage for this rollout/update cycle ("warmup" or "rl")
         """
         self.actor.vla.eval()
         
@@ -1276,12 +1484,23 @@ class OpenVLAPPO:
                             "proprio": processed_obs["robot_state"],
                         }
                         
-                        # Get action with tokenization
-                        action, action_info = self.get_action(
-                            actor_obs, 
-                            task_prompts[env_idx],
-                            temperature=self.cfg.rollout_temperature,
-                        )
+                        # Get action using stage-locked policy for this update
+                        use_l1 = self._should_use_l1_actions(stage)
+                        if use_l1:
+                            action, action_info = self.get_action(
+                                actor_obs,
+                                task_prompts[env_idx],
+                                temperature=self.cfg.rollout_temperature,
+                                use_builtin_predict=False,
+                            )
+                            l1_action = action_info.get("l1_action", action)
+                        else:
+                            action, action_info = self._get_action_via_tokens(
+                                actor_obs,
+                                task_prompts[env_idx],
+                                temperature=self.cfg.rollout_temperature,
+                            )
+                            l1_action = None
                         
                         # Step environment
                         next_obs, reward, terminated, truncated, infos = env.step(action)
@@ -1307,8 +1526,10 @@ class OpenVLAPPO:
                             pixel_values=action_info['pixel_values'],
                             proprio=action_info['proprio'],
                             action=action,
+                            l1_action=l1_action,
                             reward=sparse_reward,
                             done=done,
+                            value=0.0,
                             old_log_prob=action_info['log_prob'],
                         )
                         
@@ -1342,11 +1563,11 @@ class OpenVLAPPO:
                             "proprio": processed_obs["proprio"],  # Use 8D axis-angle format
                         }
                         
-                        # Choose policy based on training phase
-                        use_l1 = self._should_use_l1_actions()
+                        # Choose policy based on locked stage for this update
+                        use_l1 = self._should_use_l1_actions(stage)
                         
                         if use_l1:
-                            # Warmup/Transition: Get action chunk (8 actions) using L1 head
+                            # Warmup stage: get action chunk (8 actions) using L1 head
                             actions_chunk, action_info = self.get_action(
                                 actor_obs,
                                 task_prompts[0],
@@ -1358,7 +1579,7 @@ class OpenVLAPPO:
                             # The action_info already contains 'l1_action' key from _get_action_l1_with_logprobs
                             l1_actions_chunk = action_info.get('l1_action', actions_chunk)
                         else:
-                            # RL phase: Get action chunk using tokenized head
+                            # RL stage: get action chunk using tokenized head
                             actions_chunk, action_info = self._get_action_via_tokens(
                                 actor_obs,
                                 task_prompts[0],
@@ -1416,6 +1637,22 @@ class OpenVLAPPO:
                     if should_add_chunk:
                         # Compute chunk reward (use sparse reward if done, else 0)
                         chunk_reward = sparse_reward if done else 0.0
+                        response_mask, action_mask, executed_action_count, executed_token_count, chunk_is_partial = (
+                            self._build_execution_masks(
+                                self.current_action_info['responses'],
+                                self.current_actions_chunk,
+                                executed_action_count=self.chunk_step_count,
+                            )
+                        )
+                        token_log_probs = self.current_action_info.get('token_log_probs')
+                        if token_log_probs is not None:
+                            chunk_old_log_prob, masked_token_count = self._masked_token_mean(
+                                token_log_probs,
+                                response_mask,
+                            )
+                            executed_token_count = masked_token_count
+                        else:
+                            chunk_old_log_prob = self.current_action_info['log_prob']
                         
                         # Add ONCE per chunk to trajectory buffer
                         self.trajectory_buffer.add(
@@ -1430,7 +1667,12 @@ class OpenVLAPPO:
                             reward=chunk_reward,
                             done=done,
                             value=0.0,
-                            old_log_prob=self.current_action_info['log_prob'],
+                            old_log_prob=chunk_old_log_prob.detach(),
+                            response_mask=response_mask.cpu(),
+                            action_mask=action_mask,
+                            executed_action_count=executed_action_count,
+                            executed_token_count=executed_token_count,
+                            chunk_is_partial=chunk_is_partial,
                         )
                         
                         # Reset chunk tracking
@@ -1468,9 +1710,9 @@ class OpenVLAPPO:
         )
         
         # Log rollout policy for tracking training phase
-        rollout_policy = self._get_rollout_policy_name()
-        print(f"\n🎯 Rollout Policy: {rollout_policy}")
-        if self.cfg.use_l1_warmstart:
+        rollout_policy = self._get_rollout_policy_name(stage)
+        print(f"\nRollout Policy: {rollout_policy}")
+        if self.cfg.use_l1_warmstart and stage == "warmup":
             warmup_progress = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
             print(f"   Warmup Progress: {warmup_progress:.1%} ({self.global_step}/{self.cfg.l1_warmup_steps} steps)")
         
@@ -1478,18 +1720,45 @@ class OpenVLAPPO:
         data_for_debug = self.trajectory_buffer.get()
         if len(data_for_debug['old_log_probs']) > 0:
             old_log_probs_np = data_for_debug['old_log_probs'].cpu().numpy()
-            print(f"\n📊 Old Log Probability Statistics (from rollout):")
+            print(f"\nOld Log Probability Statistics (from rollout):")
             print(f"   Mean: {old_log_probs_np.mean():.6f}")
             print(f"   Std: {old_log_probs_np.std():.6f}")
             print(f"   Min: {old_log_probs_np.min():.6f}")
             print(f"   Max: {old_log_probs_np.max():.6f}")
             print(f"   Any NaN: {np.isnan(old_log_probs_np).any()}")
             print(f"   Any Inf: {np.isinf(old_log_probs_np).any()}")
-        
+
+        partial_chunk_fraction = (
+            float(np.mean(data_for_debug['chunk_is_partial']))
+            if len(data_for_debug['chunk_is_partial']) > 0
+            else 0.0
+        )
+        mean_executed_chunk_len = (
+            float(np.mean(data_for_debug['executed_action_counts']))
+            if len(data_for_debug['executed_action_counts']) > 0
+            else 0.0
+        )
+        mean_executed_token_count = (
+            float(np.mean(data_for_debug['executed_token_counts']))
+            if len(data_for_debug['executed_token_counts']) > 0
+            else 0.0
+        )
+        positive_advantage_fraction = (
+            float(np.mean(data_for_debug['advantages'] > 0))
+            if len(data_for_debug['advantages']) > 0
+            else 0.0
+        )
+
         # Compute statistics
         success_rate = np.mean(episode_successes) if episode_successes else 0.0
         mean_length = np.mean(episode_lengths) if episode_lengths else 0.0
         num_trajectories = len(self.trajectory_buffer)
+        if stage == "rl":
+            self.zero_success_rollout_streak = (
+                self.zero_success_rollout_streak + 1 if success_rate == 0.0 else 0
+            )
+        else:
+            self.zero_success_rollout_streak = 0
         
         stats = {
             "rollout/mean_reward": success_rate,  # Success rate as reward
@@ -1497,23 +1766,32 @@ class OpenVLAPPO:
             "rollout/success_rate": success_rate,
             "rollout/num_episodes": len(episode_successes),
             "rollout/num_trajectories": num_trajectories,
+            "rollout/partial_chunk_fraction": partial_chunk_fraction,
+            "rollout/mean_executed_chunk_len": mean_executed_chunk_len,
+            "rollout/mean_executed_token_count": mean_executed_token_count,
+            "rollout/positive_advantage_fraction": positive_advantage_fraction,
+            "rollout/zero_success_streak": float(self.zero_success_rollout_streak),
         }
         
         # Print rollout summary
-        print(f"\n📊 Rollout Summary:")
+        print(f"\n Rollout Summary:")
         print(f"   Trajectories collected: {num_trajectories}")
         print(f"   Episodes completed: {len(episode_successes)}")
         print(f"   Success rate: {success_rate*100:.1f}%")
         print(f"   Mean episode length: {mean_length:.1f} steps")
         print(f"   Steps collected: {steps_collected}/{self.cfg.n_steps}")
+        print(f"   Partial chunks: {partial_chunk_fraction:.1%}")
+        print(f"   Mean executed chunk length: {mean_executed_chunk_len:.2f}")
+        if stage == "rl":
+            print(f"   RL zero-success streak: {self.zero_success_rollout_streak}")
         
         return stats
     
-    def update_policy(self, task_prompt: str) -> Dict[str, float]:
+    def update_policy(self, task_prompt: str, stage: str) -> Dict[str, float]:
         """
         Update policy using appropriate loss based on training stage:
         - Warmup stage: Behavior cloning with cross-entropy loss (L1 actions as targets)
-        - Transition/RL stages: PPO with GRPO advantages
+        - RL stage: PPO with GRPO advantages
         
         Implements PPO policy gradient with:
         - Action token log probabilities
@@ -1525,12 +1803,10 @@ class OpenVLAPPO:
         Note: GRPO computes advantages directly from sparse rewards,
         no value function needed.
         """
-        # Check if we should use behavior cloning (warmup phase)
-        training_stage = self._get_training_stage()
-        if training_stage == "warmup":
+        # Warmup uses supervised BC updates; RL uses PPO updates.
+        if stage == "warmup":
             return self._bc_update_from_l1(task_prompt)
-        
-        # Otherwise, use PPO loss (transition and RL phases)
+        # Otherwise, use PPO loss (RL stage)
         # Aggressive cleanup before training to prevent CUDA memory corruption
         import gc
         torch.cuda.empty_cache()
@@ -1568,9 +1844,31 @@ class OpenVLAPPO:
         returns = torch.FloatTensor(data["returns"]).to(self.training_device)
         old_log_probs = data["old_log_probs"].to(self.training_device)
         responses = data["responses"].to(self.training_device)
-        
+        response_masks = data["response_masks"].to(self.training_device)
+
+        # If rollout has no positive reward signal, skip RL update to avoid
+        # entropy-only drift that can randomize the policy.
+        if not torch.any(advantages > 0):
+            print("\n⚠️  No positive advantages in rollout; skipping RL update to avoid entropy-only drift.")
+            return {
+                "train/no_positive_advantages": 1.0,
+                "train/policy_loss": 0.0,
+                "train/total_loss": 0.0,
+                "train/clipfrac": 0.0,
+                "train/clipfrac_p50": 0.0,
+                "train/clipfrac_p90": 0.0,
+                "train/clipfrac_max": 0.0,
+                "train/approx_kl": 0.0,
+                "train/entropy": 0.0,
+                "train/entropy_bonus": 0.0,
+                "train/adv_signal_fraction": 0.0,
+                "train/valid_token_count": 0.0,
+            }
+
         # Training statistics
         stats = defaultdict(list)
+        clipfrac_values: List[float] = []
+        valid_token_counts: List[int] = []
         
         # Multiple epochs of optimization
         epoch_pbar = tqdm(
@@ -1612,19 +1910,23 @@ class OpenVLAPPO:
                 mb_advantages = advantages[mb_indices_cpu].to(self.training_device)
                 mb_old_log_probs = old_log_probs[mb_indices_cpu].to(self.training_device)
                 mb_responses = responses[mb_indices_cpu].to(self.training_device)
+                mb_response_masks = response_masks[mb_indices_cpu].to(self.training_device)
                 
                 # ==================== ACTOR UPDATE (PPO Policy Gradient) ====================
                 # Batch process samples with gradient accumulation
                 self.actor_optimizer.zero_grad()
                 
                 total_policy_loss = 0.0
+                total_total_loss = 0.0
                 total_clipfrac = 0.0
                 total_approx_kl = 0.0
                 total_entropy = 0.0
+                total_entropy_bonus = 0.0
+                total_adv_signal_count = 0.0
+                minibatch_valid_token_counts: List[int] = []
                 
                 # Collect all action data in a batch to minimize GPU transfers
                 batch_logits = []
-                batch_log_probs = []
                 
                 for i, idx in enumerate(mb_indices_cpu):
                     obs = data["observations"][idx.item()]
@@ -1647,42 +1949,46 @@ class OpenVLAPPO:
                 
                 # Debug first minibatch
                 if minibatch_idx == 0:
-                    print(f"\n🔍 Debugging Minibatch {minibatch_idx}:")
+                    print(f"\n Debugging Minibatch {minibatch_idx}:")
                 
                 for i, logits in enumerate(batch_logits):
                     response = mb_responses[i]
+                    response_mask = mb_response_masks[i].to(self.training_device, dtype=torch.bool)
                     old_log_prob = mb_old_log_probs[i]
                     advantage = mb_advantages[i]
                     
                     # Check for NaN/inf in inputs
                     if torch.isnan(old_log_prob).any() or torch.isinf(old_log_prob).any():
-                        print(f"\n⚠️  WARNING: NaN/inf in old_log_prob at sample {i}! Skipping sample.")
+                        print(f"\n  WARNING: NaN/inf in old_log_prob at sample {i}! Skipping sample.")
                         continue
                     
                     if torch.isnan(advantage).any() or torch.isinf(advantage).any():
-                        print(f"\n⚠️  WARNING: NaN/inf in advantage at sample {i}! Skipping sample.")
+                        print(f"\n  WARNING: NaN/inf in advantage at sample {i}! Skipping sample.")
                         continue
                     
                     # Map response tokens to indices in [0, 255]
                     response_indices = response - (self.action_tokenizer.vocab_size - 256)
-                    
+
                     # Ensure logits and response_indices are on the same device
                     logits = logits.to(self.training_device)
                     response_indices = response_indices.to(self.training_device)
-                    log_prob = logprobs_from_logits(logits.unsqueeze(0), response_indices.unsqueeze(0))
-                    # CRITICAL: Use mean to match rollout computation and prevent massive values
-                    log_prob = log_prob.mean()  # Mean over action dimensions
-                    
+                    log_probs_per_token = logprobs_from_logits(logits.unsqueeze(0), response_indices.unsqueeze(0)).squeeze(0)
+                    log_prob, valid_token_count = self._masked_token_mean(log_probs_per_token, response_mask)
+                    if valid_token_count <= 0:
+                        print(f"\n  WARNING: No valid PPO tokens at sample {i}! Skipping sample.")
+                        continue
+
                     # Compute entropy from action distribution (measure of exploration)
                     # H = -sum(p * log(p)) where p = softmax(logits)
                     action_probs = torch.softmax(logits, dim=-1)  # (seq_len, 256)
-                    entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()  # Mean over sequence
-                    # Log entropy for PPO/transition phase
+                    entropy_per_token = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1)
+                    entropy, _ = self._masked_token_mean(entropy_per_token, response_mask)
+                    # Log entropy for PPO phase
                     stats['train/ppo_entropy'].append(entropy.item())
                     
                     # Check for NaN in computed log_prob
                     if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
-                        print(f"\n⚠️  WARNING: NaN/inf in computed log_prob at sample {i}!")
+                        print(f"\n  WARNING: NaN/inf in computed log_prob at sample {i}!")
                         print(f"   old_log_prob: {old_log_prob.item():.4f}")
                         print(f"   Skipping sample.")
                         continue
@@ -1727,35 +2033,46 @@ class OpenVLAPPO:
                     clip_low = torch.clamp(ratio, 1 - self.cfg.clip_ratio_high, 1 + self.cfg.clip_ratio_low)
                     clipped_ratio = torch.where(advantage_clamped > 0, clip_high, clip_low)
                     policy_loss = -torch.min(ratio * advantage_clamped, clipped_ratio * advantage_clamped)
+                    has_adv_signal = torch.abs(advantage_clamped).item() > 1e-8
+                    entropy_bonus = self.cfg.entropy_coef * entropy if has_adv_signal else torch.zeros_like(policy_loss)
+                    total_loss = policy_loss - entropy_bonus
                     
                     # Debug first sample
                     if minibatch_idx == 0 and i == 0:
                         print(f"     ratio: {ratio.item():.4f}")
                         print(f"     clipped_ratio: {clipped_ratio.item():.4f}")
                         print(f"     policy_loss: {policy_loss.item():.4f}")
+                        print(f"     entropy_bonus: {entropy_bonus.item():.4f}")
+                        print(f"     total_loss: {total_loss.item():.4f}")
                         print(f"     Has NaN: old_log={torch.isnan(old_log_prob).any()}, new_log={torch.isnan(log_prob).any()}, adv={torch.isnan(advantage).any()}, loss={torch.isnan(policy_loss).any()}")
                     
                     # Safety check: if loss is extreme, skip this sample
-                    if torch.abs(policy_loss).item() > 100.0:
-                        print(f"\n⚠️  WARNING: Extreme policy loss {policy_loss.item():.2f} at sample {i}! Skipping.")
+                    if torch.abs(total_loss).item() > 100.0:
+                        print(f"\n  WARNING: Extreme total loss {total_loss.item():.2f} at sample {i}! Skipping.")
                         continue
                     
                     # Accumulate loss (normalize by batch size for gradient averaging)
-                    accumulated_loss += policy_loss / len(mb_indices)
+                    accumulated_loss += total_loss / len(mb_indices)
                     num_valid_samples += 1
                     
                     # Track statistics
                     total_policy_loss += policy_loss.item()
+                    total_total_loss += total_loss.item()
                     total_entropy += entropy.item()
+                    total_entropy_bonus += entropy_bonus.item()
+                    total_adv_signal_count += 1.0 if has_adv_signal else 0.0
+                    minibatch_valid_token_counts.append(valid_token_count)
+                    valid_token_counts.append(valid_token_count)
                     with torch.no_grad():
                         clipfrac = ((ratio - clipped_ratio).abs() > 1e-6).float().mean()
                         approx_kl = (old_log_prob - log_prob).mean()
                         total_clipfrac += clipfrac.item()
                         total_approx_kl += approx_kl.item()
+                        clipfrac_values.append(clipfrac.item())
                 
                 # Check if we have any valid samples
                 if num_valid_samples == 0:
-                    print(f"\n⚠️  WARNING: No valid samples in minibatch! Skipping backward pass.")
+                    print(f"\n  WARNING: No valid samples in minibatch! Skipping backward pass.")
                     continue
                 
                 # Debug accumulated loss
@@ -1785,7 +2102,7 @@ class OpenVLAPPO:
                         break
                 
                 if has_nan_grad:
-                    print(f"\n⚠️  WARNING: NaN or inf detected in gradients! Skipping optimizer step.")
+                    print(f"\n  WARNING: NaN or inf detected in gradients! Skipping optimizer step.")
                     self.actor_optimizer.zero_grad()
                     continue
                 
@@ -1795,14 +2112,14 @@ class OpenVLAPPO:
                 # Skip only truly catastrophic gradient explosions (>1000x)
                 # With LoRA (55M params), even gradients of 100-500 can be clipped and trained
                 if total_norm > self.max_grad_norm * 1000:
-                    print(f"\n⚠️  CRITICAL: Gradient explosion: {total_norm:.2f} (clip at {self.max_grad_norm})")
+                    print(f"\n  CRITICAL: Gradient explosion: {total_norm:.2f} (clip at {self.max_grad_norm})")
                     print(f"   Skipping optimizer step to prevent training collapse.")
                     self.actor_optimizer.zero_grad()
                     continue
                 
                 # Warn if gradient norm is very large (but clipping handles it)
                 if total_norm > self.max_grad_norm * 100:
-                    print(f"⚠️  Large gradient: {total_norm:.2f} → clipped to {self.max_grad_norm}")
+                    print(f"  Large gradient: {total_norm:.2f} → clipped to {self.max_grad_norm}")
                 
                 # Optimizer step
                 self.actor_optimizer.step()
@@ -1810,9 +2127,14 @@ class OpenVLAPPO:
                 # Track averaged statistics for this minibatch
                 n_samples = len(mb_indices)
                 stats['train/policy_loss'].append(total_policy_loss / n_samples)
+                stats['train/total_loss'].append(total_total_loss / n_samples)
                 stats['train/clipfrac'].append(total_clipfrac / n_samples)
                 stats['train/approx_kl'].append(total_approx_kl / n_samples)
                 stats['train/entropy'].append(total_entropy / n_samples)
+                stats['train/entropy_bonus'].append(total_entropy_bonus / n_samples)
+                stats['train/adv_signal_fraction'].append(total_adv_signal_count / n_samples)
+                if minibatch_valid_token_counts:
+                    stats['train/valid_token_count'].append(float(np.mean(minibatch_valid_token_counts)))
                 
                 # Update minibatch progress bar with current stats
                 minibatch_pbar.set_postfix({
@@ -1827,16 +2149,22 @@ class OpenVLAPPO:
             
             # Calculate and print epoch statistics
             epoch_policy_loss = np.mean([s for s in stats['train/policy_loss'][-num_minibatches:]])
+            epoch_total_loss = np.mean([s for s in stats['train/total_loss'][-num_minibatches:]])
             epoch_clipfrac = np.mean([s for s in stats['train/clipfrac'][-num_minibatches:]])
             epoch_approx_kl = np.mean([s for s in stats['train/approx_kl'][-num_minibatches:]])
             epoch_entropy = np.mean([s for s in stats['train/entropy'][-num_minibatches:]])
+            epoch_entropy_bonus = np.mean([s for s in stats['train/entropy_bonus'][-num_minibatches:]])
+            epoch_adv_signal_fraction = np.mean([s for s in stats['train/adv_signal_fraction'][-num_minibatches:]])
             
             # Print epoch summary
             print(f"\n  Epoch {epoch+1}/{self.cfg.n_epochs} → "
+                  f"Total Loss: {epoch_total_loss:.6f} | "
                   f"Policy Loss: {epoch_policy_loss:.6f} | "
                   f"Clip Frac: {epoch_clipfrac:.4f} | "
                   f"KL: {epoch_approx_kl:.6f} | "
-                  f"Entropy: {epoch_entropy:.4f}")
+                  f"Entropy: {epoch_entropy:.4f} | "
+                  f"Entropy Bonus: {epoch_entropy_bonus:.4f} | "
+                  f"Adv Signal: {epoch_adv_signal_fraction:.3f}")
             
             # Update epoch progress bar with average stats
             epoch_pbar.set_postfix({
@@ -1845,8 +2173,19 @@ class OpenVLAPPO:
             }, refresh=False)
         
         epoch_pbar.close()
-        # ...existing code...
-        return {k: np.mean(v) for k, v in stats.items()}
+        aggregated_stats = {k: np.mean(v) for k, v in stats.items()}
+        if clipfrac_values:
+            aggregated_stats['train/clipfrac_p50'] = float(np.percentile(clipfrac_values, 50))
+            aggregated_stats['train/clipfrac_p90'] = float(np.percentile(clipfrac_values, 90))
+            aggregated_stats['train/clipfrac_max'] = float(np.max(clipfrac_values))
+        else:
+            aggregated_stats['train/clipfrac_p50'] = 0.0
+            aggregated_stats['train/clipfrac_p90'] = 0.0
+            aggregated_stats['train/clipfrac_max'] = 0.0
+        aggregated_stats['train/valid_token_count'] = (
+            float(np.mean(valid_token_counts)) if valid_token_counts else 0.0
+        )
+        return aggregated_stats
     
     def validate_tokenized(self, env, task_prompt: str) -> Dict[str, float]:
         """
@@ -2171,13 +2510,10 @@ class OpenVLAPPO:
                 # Define custom metrics for stage separation
                 wandb.define_metric("global_step")
                 wandb.define_metric("warmup/stage_step")
-                wandb.define_metric("transition/stage_step")
                 wandb.define_metric("rl/stage_step")
                 
                 # Set all warmup metrics to use warmup/stage_step as x-axis
                 wandb.define_metric("warmup/*", step_metric="warmup/stage_step")
-                # Set all transition metrics to use transition/stage_step as x-axis
-                wandb.define_metric("transition/*", step_metric="transition/stage_step")
                 # Set all rl metrics to use rl/stage_step as x-axis
                 wandb.define_metric("rl/*", step_metric="rl/stage_step")
                 
@@ -2187,7 +2523,7 @@ class OpenVLAPPO:
                 wandb.define_metric("stage/*", step_metric="global_step")
                 
                 print(f"✓ Configured custom metrics for stage separation")
-                print(f"  Stages: warmup, transition, rl")
+                print(f"  Stages: warmup, rl")
                 print("="*70 + "\n")
                 
             except Exception as e:
@@ -2205,7 +2541,7 @@ class OpenVLAPPO:
             obs_mode="raw",  # We'll process manually
             action_normalization="none",  # VLA handles normalization
             auto_reset=True if self.is_vectorized else False,
-            seed=0,  # IMPORTANT: Use seed 0 to match high-success evaluation setup
+            seed=self.cfg.seed,
             num_steps_wait=10,  # Wait 10 steps after reset for stabilization (matches eval)
         )
         
@@ -2227,41 +2563,64 @@ class OpenVLAPPO:
                     "val/l1_success_rate": initial_val_stats['val/l1_success_rate'],
                     "val/tokenized_success_rate": initial_val_stats['val/tokenized_success_rate'],
                     "val/gap": initial_val_stats['val/gap'],
-                }, step=0)
+                }, step=self.global_step)
                 print(f"✓ Logged initial validation to wandb: L1={initial_val_stats['val/l1_success_rate']:.2%}, Tokenized={initial_val_stats['val/tokenized_success_rate']:.2%}, Gap={initial_val_stats['val/gap']:.2%}")
             except Exception as e:
                 print(f"⚠️  WARNING: Failed to log initial validation to wandb: {e}")
         
         # Training loop
-        num_updates = self.cfg.total_timesteps // (self.cfg.n_steps * self.cfg.num_envs) if self.is_vectorized else self.cfg.total_timesteps // self.cfg.n_steps
-        
+        steps_per_update = (self.cfg.n_steps * self.cfg.num_envs) if self.is_vectorized else self.cfg.n_steps
+        num_updates = self.cfg.total_timesteps // steps_per_update
+        completed_updates = self.global_step // steps_per_update
+        start_update = min(completed_updates, num_updates)
+
+        if completed_updates > 0:
+            print(
+                f"🔁 Resume status: global_step={self.global_step}, "
+                f"completed_updates={completed_updates}, target_updates={num_updates}"
+            )
+            if start_update >= num_updates:
+                print("✓ Target timesteps already reached by loaded checkpoint. Skipping training loop.")
+
         pbar = tqdm(
-            range(num_updates),
+            range(start_update, num_updates),
             desc="Training",
             unit="update",
             ncols=120,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
         )
         for update in pbar:
-            # Update training stage tracking
-            self._update_training_stage()
+            prev_stage = self.training_stage
+            # Lock stage once per rollout+update cycle for clean boundaries.
+            stage = self._update_training_stage()
+
+            # Save a rolling latest snapshot for the previous stage when stage changes.
+            if stage != prev_stage:
+                print(f"\n Saving latest checkpoint for stage '{prev_stage}'...")
+                self._save_stage_latest_checkpoint(
+                    prev_stage,
+                    reason=f"stage_change_to_{stage}",
+                    extra_metadata={"saved_on_stage_change_to": stage},
+                )
             
             # Collect rollouts
-            rollout_stats = self.collect_rollouts(env, task_prompts)
+            rollout_stats = self.collect_rollouts(env, task_prompts, stage=stage)
             
             # Update policy (pass first task_prompt for value computation)
             # In multi-task, we use a generic prompt for value updates
             update_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
-            train_stats = self.update_policy(update_prompt)
+            train_stats = self.update_policy(update_prompt, stage=stage)
             
             # Increment update counter AFTER policy update
             self.update_count += 1
+            if stage == "rl" and stage not in self.stage_latest_checkpoint_paths:
+                print("\n Saving initial latest RL checkpoint...")
+                self._save_stage_latest_checkpoint(stage, reason="first_rl_update")
             
             # Combine stats with stage prefixes
             stats = {}
             
             # Add stage-prefixed metrics
-            stage = self.training_stage
             for key, value in {**rollout_stats, **train_stats}.items():
                 # Skip already prefixed metrics
                 if "/" in key:
@@ -2273,14 +2632,21 @@ class OpenVLAPPO:
             stats["global_step"] = self.global_step
             stats["stage/current"] = stage
             stats[f"{stage}/stage_step"] = self.stage_step
-            
+            stats["rl/best_success_rate"] = self.stage_best_success_rates.get("rl", 0.0)
+            if stage == "rl":
+                stats["rl/zero_success_rollout_streak"] = float(self.zero_success_rollout_streak)
+
             # Add rollout policy tracking
             if self.cfg.use_l1_warmstart:
-                stats["rollout/uses_l1"] = int(self._should_use_l1_actions())
-                stats["rollout/warmup_progress"] = min(1.0, self.global_step / self.cfg.l1_warmup_steps)
-                if self.global_step < self.cfg.l1_warmup_steps + self.cfg.l1_transition_steps:
-                    transition_progress = max(0.0, (self.global_step - self.cfg.l1_warmup_steps) / self.cfg.l1_transition_steps)
-                    stats["rollout/transition_progress"] = transition_progress
+                stats["rollout/uses_l1"] = int(self._should_use_l1_actions(stage))
+                warmup_denom = max(1, self.cfg.l1_warmup_steps)
+                stats["rollout/warmup_progress"] = min(1.0, self.global_step / warmup_denom)
+                stats["warmup/gate_consecutive_hits"] = float(self.warmup_gate_consecutive_hits)
+                stats["warmup/gate_required_consecutive"] = float(max(1, self.cfg.l1_warmup_required_consecutive))
+                stats["warmup/gate_threshold"] = float(self.cfg.l1_warmup_success_threshold)
+                stats["warmup/gate_window"] = float(max(1, self.cfg.l1_warmup_success_window))
+                if self.warmup_gate_last_rolling_success is not None:
+                    stats["warmup/gate_rolling_success"] = float(self.warmup_gate_last_rolling_success)
             
             # Print policy loss after every update
             if "train/policy_loss" in train_stats:
@@ -2290,20 +2656,39 @@ class OpenVLAPPO:
             
             # Validation - check AFTER global_step is updated (not before)
             if self.global_step > 0 and self.global_step % self.cfg.val_interval == 0:
-                print(f"\n🔍 Running validation at step {self.global_step}...")
+                print(f"\n Running validation at step {self.global_step}...")
                 # For multi-task, validate on first task (could extend to all tasks)
                 val_prompt = task_prompts[0] if isinstance(task_prompts, list) else task_prompts
                 val_stats = self.validate(env, val_prompt)
                 stats.update(val_stats)
-                print(f"✓ Validation complete: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
+                print(f" Validation complete: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
+
+                # Update warmup competence gate from tokenized validation success.
+                if self.cfg.use_l1_warmstart and stage == "warmup":
+                    self._update_warmup_gate(val_stats["val/tokenized_success_rate"])
+                    should_exit_warmup, gate_reason = self._should_exit_warmup(step=self.global_step)
+                    rolling_success = (
+                        f"{self.warmup_gate_last_rolling_success:.3f}"
+                        if self.warmup_gate_last_rolling_success is not None
+                        else "n/a"
+                    )
+                    print(
+                        "   Warmup gate: "
+                        f"rolling={rolling_success} "
+                        f"| hits={self.warmup_gate_consecutive_hits}/{max(1, self.cfg.l1_warmup_required_consecutive)} "
+                        f"| next_stage={'rl' if should_exit_warmup else 'warmup'}"
+                    )
+                    print(f"   Gate reason: {gate_reason}")
+                    stats["warmup/gate_next_stage_rl"] = float(1.0 if should_exit_warmup else 0.0)
                 
-                # Check if this is the best model (based on tokenized success rate)
+                # Check if this is the best model for the current stage (based on tokenized success rate)
                 current_success = val_stats['val/tokenized_success_rate']
-                if current_success > self.best_success_rate:
-                    self.best_success_rate = current_success
+                if current_success > self.stage_best_success_rates.get(stage, 0.0):
+                    self.stage_best_success_rates[stage] = current_success
+                    self.best_success_rate = max(self.best_success_rate, current_success)
                     
-                    # Save best checkpoint
-                    best_filename = f"best_model_stage_{stage}_success_{current_success:.3f}.pt"
+                    # Save stage-best checkpoint (fixed filename per stage).
+                    best_filename = f"best_model_stage_{stage}.pt"
                     metadata = {
                         "success_rate": current_success,
                         "l1_success_rate": val_stats['val/l1_success_rate'],
@@ -2312,17 +2697,25 @@ class OpenVLAPPO:
                         "stage": stage,
                     }
                     
-                    print(f"\n🏆 New best model! Success rate: {current_success:.2%}")
+                    print(f"\n New best model for stage '{stage}'! Success rate: {current_success:.2%}")
                     saved_path = self.save_checkpoint(best_filename, metadata=metadata)
-                    
-                    # Remove old best checkpoint if exists
-                    if self.best_checkpoint_path and self.best_checkpoint_path != saved_path:
-                        if self.best_checkpoint_path.exists():
-                            self.best_checkpoint_path.unlink()
-                            print(f"  Removed old best checkpoint: {self.best_checkpoint_path.name}")
-                    
-                    self.best_checkpoint_path = saved_path
-                
+                    self.stage_best_checkpoint_paths[stage] = saved_path
+
+                    # Keep global best checkpoint pointer for summary output.
+                    if current_success >= self.best_success_rate:
+                        self.best_checkpoint_path = saved_path
+
+                latest_stage_path = self._save_stage_latest_checkpoint(
+                    stage,
+                    reason="validation",
+                    extra_metadata={
+                        "success_rate": current_success,
+                        "l1_success_rate": val_stats['val/l1_success_rate'],
+                        "gap": val_stats['val/gap'],
+                    },
+                )
+                print(f"   Latest {stage} checkpoint: {latest_stage_path}")
+
                 # ALWAYS log validation metrics to wandb immediately
                 if self.cfg.use_wandb:
                     try:
@@ -2332,21 +2725,9 @@ class OpenVLAPPO:
                             "val/gap": val_stats['val/gap'],
                             "val/best_success_rate": self.best_success_rate,
                         }, step=self.global_step)
-                        print(f"✓ Logged validation metrics to wandb: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
+                        print(f" Logged validation metrics to wandb: L1={val_stats['val/l1_success_rate']:.2%}, Tokenized={val_stats['val/tokenized_success_rate']:.2%}, Gap={val_stats['val/gap']:.2%}")
                     except Exception as e:
-                        print(f"⚠️  WARNING: Failed to log validation to wandb: {e}")
-            
-            # Save periodic checkpoint every N updates (configurable)
-            if self.update_count > 0 and self.update_count % self.cfg.save_interval == 0:
-                periodic_filename = f"checkpoint_stage_{stage}_update_{self.update_count}_step_{self.global_step}.pt"
-                metadata = {
-                    "global_step": self.global_step,
-                    "update_count": self.update_count,
-                    "stage": stage,
-                    "rollout_success_rate": rollout_stats.get('rollout/success_rate', 0.0),
-                }
-                print(f"\n💾 Saving periodic checkpoint (update {self.update_count})...")
-                self.save_checkpoint(periodic_filename, metadata=metadata)
+                        print(f"  WARNING: Failed to log validation to wandb: {e}")
             
             # Update progress bar with stats
             pbar_stats = {
@@ -2361,6 +2742,8 @@ class OpenVLAPPO:
                 pbar_stats["clip"] = f"{stats['train/clipfrac']:.3f}"
             if "val/tokenized_success_rate" in stats:
                 pbar_stats["val"] = f"{stats['val/tokenized_success_rate']:.1%}"
+            if stage == "rl":
+                pbar_stats["zero"] = int(self.zero_success_rollout_streak)
             pbar.set_postfix(pbar_stats, refresh=True)
             
             # Log to wandb after every policy update
@@ -2386,36 +2769,26 @@ class OpenVLAPPO:
                     try:
                         wandb.log(clean_stats, step=self.global_step)
                         
-                        # Also log checkpoint info if periodic save happened
-                        if self.update_count % self.cfg.save_interval == 0:
-                            wandb.log({
-                                "checkpoint/update_count": self.update_count,
-                                "checkpoint/best_success_rate": self.best_success_rate,
-                            }, step=self.global_step)
-                        
                         # Print confirmation every 10 updates to avoid spam
                         if update % 10 == 0:
                             print(f"\n✓ Logged {len(clean_stats)} metrics to wandb at step {self.global_step}")
                             print(f"   train/policy_loss={clean_stats.get('train/policy_loss', 'N/A')}, rollout/success_rate={clean_stats.get('rollout/success_rate', 'N/A')}")
                     except Exception as e:
-                        print(f"\n⚠️  WARNING: Failed to log to wandb: {e}")
+                        print(f"\n  WARNING: Failed to log to wandb: {e}")
                         if update % 10 == 0:  # Only print detailed debug every 10 updates
                             print(f"   Stats types: {[(k, type(v)) for k, v in stats.items()][:5]}...")  # First 5 only
                 else:
-                    print(f"\n⚠️  WARNING: No valid stats to log (all NaN/inf) at update {update}")
+                    print(f"\n  WARNING: No valid stats to log (all NaN/inf) at update {update}")
         
         pbar.close()
-        
-        # Save final checkpoint
-        print(f"\n💾 Saving final checkpoint...")
-        final_filename = f"final_model_step_{self.global_step}.pt"
-        final_metadata = {
-            "global_step": self.global_step,
-            "update_count": self.update_count,
-            "stage": self.training_stage,
-            "best_success_rate": self.best_success_rate,
-        }
-        self.save_checkpoint(final_filename, metadata=final_metadata)
+
+        # Save latest checkpoint for the final active stage.
+        print(f"\n Saving latest checkpoint for stage '{self.training_stage}' (final)...")
+        self._save_stage_latest_checkpoint(
+            self.training_stage,
+            reason="final",
+            extra_metadata={"best_success_rate": self.best_success_rate},
+        )
         
         env.close()
         
@@ -2427,7 +2800,7 @@ class OpenVLAPPO:
                 wandb.finish()
                 print("✓ wandb run finished and synced to cloud")
             except Exception as e:
-                print(f"⚠️  WARNING: Error finishing wandb: {e}")
+                print(f"  WARNING: Error finishing wandb: {e}")
             print("="*70 + "\n")
         
         print("\n" + "="*70)
@@ -2436,9 +2809,32 @@ class OpenVLAPPO:
         print(f"  Best success rate: {self.best_success_rate:.2%}")
         if self.best_checkpoint_path:
             print(f"  Best checkpoint: {self.best_checkpoint_path.name}")
+        latest_rl_checkpoint = self.stage_latest_checkpoint_paths.get("rl")
+        if latest_rl_checkpoint:
+            print(f"  Latest RL checkpoint: {latest_rl_checkpoint.name}")
         print("="*70)
-    
-    def save_checkpoint(self, filename: str, metadata: dict = None):
+
+    def _save_stage_latest_checkpoint(
+        self,
+        stage: str,
+        reason: str,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        """Save or overwrite the rolling latest checkpoint for a stage."""
+        metadata = {
+            "global_step": self.global_step,
+            "update_count": self.update_count,
+            "stage": stage,
+            "reason": reason,
+            "best_success_rate": self.best_success_rate,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        latest_path = self.save_checkpoint(f"latest_model_stage_{stage}.pt", metadata=metadata)
+        self.stage_latest_checkpoint_paths[stage] = latest_path
+        return latest_path
+
+    def save_checkpoint(self, filename: str, metadata: dict = None) -> Path:
         """Save model checkpoint with proper LoRA adapter handling."""
         checkpoint_dir = Path(self.cfg.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -2449,10 +2845,20 @@ class OpenVLAPPO:
             "update_count": self.update_count,
             "training_stage": self.training_stage,
             "stage_step": self.stage_step,
+            "stage_change_reason": self.stage_change_reason,
             "best_success_rate": self.best_success_rate,
+            "stage_best_success_rates": self.stage_best_success_rates,
+            "stage_best_checkpoint_paths": {k: str(v) for k, v in self.stage_best_checkpoint_paths.items()},
+            "stage_latest_checkpoint_paths": {k: str(v) for k, v in self.stage_latest_checkpoint_paths.items()},
+            "zero_success_rollout_streak": self.zero_success_rollout_streak,
             "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
             "vla_config": vars(self.vla_config),
             "ppo_config": vars(self.cfg),
+            "warmup_gate_state": {
+                "tokenized_success_history": list(self.warmup_tokenized_success_history),
+                "consecutive_hits": self.warmup_gate_consecutive_hits,
+                "last_rolling_success": self.warmup_gate_last_rolling_success,
+            },
         }
         
         # Add metadata (e.g., validation metrics)
@@ -2489,30 +2895,90 @@ class OpenVLAPPO:
         if self.actor.proprio_projector:
             checkpoint["proprio_projector_state_dict"] = self.actor.proprio_projector.state_dict()
         
-        torch.save(checkpoint, checkpoint_dir / filename)
+        checkpoint_path = checkpoint_dir / filename
+        torch.save(checkpoint, checkpoint_path)
         
         # Calculate and display checkpoint size
-        checkpoint_size_mb = (checkpoint_dir / filename).stat().st_size / (1024 * 1024)
+        checkpoint_size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
         print(f"Saved checkpoint: {filename} ({checkpoint_size_mb:.1f} MB)")
-    
-    def load_checkpoint(self, filename: str):
+        return checkpoint_path
+
+    @staticmethod
+    def _move_optimizer_state_to_device(optimizer: optim.Optimizer, device: torch.device) -> None:
+        """Move optimizer state tensors onto the requested device after CPU-first checkpoint load."""
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+
+    def _resolve_checkpoint_path(self, checkpoint_ref: str) -> Path:
+        """Resolve checkpoint file from absolute/relative path or checkpoint-dir-relative name."""
+        direct_path = Path(checkpoint_ref).expanduser()
+        if direct_path.exists():
+            return direct_path.resolve()
+
+        checkpoint_dir_path = Path(self.cfg.checkpoint_dir) / checkpoint_ref
+        if checkpoint_dir_path.exists():
+            return checkpoint_dir_path.resolve()
+
+        raise FileNotFoundError(
+            "Checkpoint not found. Tried:\n"
+            f"  - {direct_path}\n"
+            f"  - {checkpoint_dir_path}"
+        )
+
+    def load_checkpoint(self, checkpoint_ref: str, stage_override: str = "auto"):
         """Load model checkpoint with proper LoRA adapter handling."""
-        checkpoint_dir = Path(self.cfg.checkpoint_dir)
-        checkpoint_path = checkpoint_dir / filename
-        
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
-        print(f"Loading checkpoint: {filename}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint_path = self._resolve_checkpoint_path(checkpoint_ref)
+
+        print(f"Loading checkpoint: {checkpoint_path}")
+        print("  Loading checkpoint tensors on CPU first to avoid GPU resume OOM...")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
         
         # Restore training state
         self.global_step = checkpoint["global_step"]
         self.episode_count = checkpoint["episode_count"]
         self.update_count = checkpoint.get("update_count", 0)
-        self.training_stage = checkpoint.get("training_stage", "warmup")
+        loaded_stage = checkpoint.get("training_stage", "warmup")
+        if loaded_stage not in {"warmup", "rl"}:
+            # Backward compatibility with legacy stage labels after two-stage cleanup.
+            loaded_stage = "rl"
+        self.training_stage = loaded_stage
+        if not self.cfg.use_l1_warmstart:
+            self.training_stage = "rl"
+        elif self.global_step >= self.cfg.l1_warmup_steps:
+            # When loading a post-warmup checkpoint, default to RL to avoid re-running BC.
+            self.training_stage = "rl"
+
+        if stage_override in {"warmup", "rl"}:
+            self.training_stage = stage_override
+            self.stage_step = 0
+            self.stage_change_reason = f"resume_stage_override:{stage_override}"
+            print(f"  Applied stage override: {stage_override}")
+        elif stage_override != "auto":
+            raise ValueError(f"Invalid stage_override: {stage_override}")
+
         self.stage_step = checkpoint.get("stage_step", 0)
+        self.stage_change_reason = checkpoint.get("stage_change_reason", "loaded_checkpoint")
+        if stage_override in {"warmup", "rl"}:
+            self.stage_step = 0
+            self.stage_change_reason = f"resume_stage_override:{stage_override}"
         self.best_success_rate = checkpoint.get("best_success_rate", 0.0)
+        self.stage_best_success_rates.update(checkpoint.get("stage_best_success_rates", {}))
+        self.stage_best_checkpoint_paths = {
+            k: Path(v) for k, v in checkpoint.get("stage_best_checkpoint_paths", {}).items()
+        }
+        self.stage_latest_checkpoint_paths = {
+            k: Path(v) for k, v in checkpoint.get("stage_latest_checkpoint_paths", {}).items()
+        }
+        self.zero_success_rollout_streak = int(checkpoint.get("zero_success_rollout_streak", 0))
+
+        warmup_gate_state = checkpoint.get("warmup_gate_state", {})
+        window = max(1, self.cfg.l1_warmup_success_window)
+        history = warmup_gate_state.get("tokenized_success_history", [])
+        self.warmup_tokenized_success_history = deque(history, maxlen=window)
+        self.warmup_gate_consecutive_hits = int(warmup_gate_state.get("consecutive_hits", 0))
+        self.warmup_gate_last_rolling_success = warmup_gate_state.get("last_rolling_success", None)
         
         # Load VLA model based on checkpoint type
         if checkpoint.get("is_lora", False):
@@ -2545,6 +3011,7 @@ class OpenVLAPPO:
         
         # Load optimizer
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+        self._move_optimizer_state_to_device(self.actor_optimizer, self.training_device)
         print("  Loaded optimizer")
         
         # Print metadata if available
@@ -2573,19 +3040,68 @@ def main():
                        help="Number of parallel environments (must match len(task-ids) if specified)")
     parser.add_argument("--timesteps", type=int, default=100000,
                        help="Total training timesteps")
+    parser.add_argument("--pretrained-checkpoint", type=str, default="openvla-7b-oft-finetuned-libero-spatial",
+                       help="Model checkpoint path/name (local dir name/path or HF repo id)")
+    parser.add_argument("--use-hf-checkpoint", action="store_true",
+                       help="Load checkpoint from HuggingFace Hub instead of local path")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",
+                       help="Directory for periodic/best/final training checkpoints")
+    parser.add_argument("--resume-checkpoint", type=str, default=None,
+                       help="Checkpoint file to resume from (path or --checkpoint-dir-relative filename)")
+    parser.add_argument("--resume-stage", type=str, default="auto", choices=["auto", "warmup", "rl"],
+                       help="Stage after loading checkpoint: auto, warmup, or rl")
     parser.add_argument("--no-wandb", action="store_true",
                        help="Disable wandb logging")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                       help="Optional Weights & Biases entity/team")
     parser.add_argument("--use-data-parallel", action="store_true",
                        help="Enable DataParallel for multi-GPU training")
+    parser.add_argument("--seed", type=int, default=0,
+                       help="Random seed for training and environment")
+    parser.add_argument("--warmup-min-steps", type=int, default=25000,
+                       help="Minimum warmup steps before RL handoff is allowed")
+    parser.add_argument("--warmup-max-steps", type=int, default=32000,
+                       help="Safety cap for warmup steps (<=0 disables cap)")
+    parser.add_argument("--warmup-success-threshold", type=float, default=0.40,
+                       help="Rolling tokenized success threshold for warmup exit")
+    parser.add_argument("--warmup-success-window", type=int, default=3,
+                       help="Validation window size for rolling tokenized success")
+    parser.add_argument("--warmup-success-consecutive", type=int, default=2,
+                       help="Consecutive validations needed above threshold")
+    parser.add_argument("--warmup-overclone-threshold", type=float, default=0.85,
+                       help="Immediate warmup exit threshold to avoid over-cloning (set >1 to disable)")
+    parser.add_argument("--entropy-coef", type=float, default=0.002,
+                       help="Entropy bonus coefficient used in RL stage")
     
     args = parser.parse_args()
+    if args.warmup_success_window < 1:
+        parser.error("--warmup-success-window must be >= 1")
+    if args.warmup_success_consecutive < 1:
+        parser.error("--warmup-success-consecutive must be >= 1")
+    if args.warmup_min_steps < 0:
+        parser.error("--warmup-min-steps must be >= 0")
+    if args.warmup_max_steps > 0 and args.warmup_max_steps < args.warmup_min_steps:
+        parser.error("--warmup-max-steps must be >= --warmup-min-steps when enabled")
+    if not (0.0 <= args.warmup_success_threshold <= 1.0):
+        parser.error("--warmup-success-threshold must be in [0, 1]")
+    if args.warmup_overclone_threshold < 0.0:
+        parser.error("--warmup-overclone-threshold must be >= 0")
+    if args.entropy_coef < 0.0:
+        parser.error("--entropy-coef must be >= 0")
+
+    set_global_seed(args.seed)
     
     # VLA configuration - load L1 action head for validation (frozen)
     vla_config = OpenVLAActorConfig(
+        pretrained_checkpoint=args.pretrained_checkpoint,
+        use_local=not args.use_hf_checkpoint,
         load_l1_action_head=True,  # Load for validation (matches reference 98% eval)
         freeze_l1_action_head=True,  # Keep frozen for PPO (not trained)
         use_data_parallel=args.use_data_parallel,  # Enable DataParallel if flag provided
     )
+    source_label = "local" if vla_config.use_local else "huggingface_hub"
+    print(f"Checkpoint source: {source_label}")
+    print(f"Checkpoint reference: {vla_config.pretrained_checkpoint}")
     
     # PPO configuration
     ppo_config = PPOConfig(
@@ -2594,13 +3110,24 @@ def main():
         task_id=args.task_id,
         task_ids=args.task_ids,
         num_envs=args.num_envs,
+        seed=args.seed,
+        l1_warmup_steps=args.warmup_min_steps,
+        l1_warmup_max_steps=args.warmup_max_steps,
+        l1_warmup_success_threshold=args.warmup_success_threshold,
+        l1_warmup_success_window=args.warmup_success_window,
+        l1_warmup_required_consecutive=args.warmup_success_consecutive,
+        l1_warmup_overclone_threshold=args.warmup_overclone_threshold,
+        entropy_coef=args.entropy_coef,
+        checkpoint_dir=args.checkpoint_dir,
         device=vla_config.device,  # Use same device as VLA
         use_wandb=not args.no_wandb,
-        wandb_entity='deeprl_ais'
+        wandb_entity=args.wandb_entity,
     )
     
     # Initialize and train
     trainer = OpenVLAPPO(vla_config, ppo_config)
+    if args.resume_checkpoint:
+        trainer.load_checkpoint(args.resume_checkpoint, stage_override=args.resume_stage)
     trainer.train()
 
 

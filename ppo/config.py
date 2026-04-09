@@ -160,25 +160,24 @@ class PPOConfig:
     - Clip fraction consistently >0.7
     """
     
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.002
     """Coefficient for entropy bonus in the loss function.
     Encourages exploration by penalizing overly deterministic policies.
     - 0.0: No entropy bonus (deterministic policy)
-    - 0.01: Standard value for continuous control
+    - 0.002: Conservative default for sparse-reward RL handoff stability
     - 0.001-0.1: Typical range
-    Note: Currently not used since VLA is deterministic, but kept for future stochastic versions.
+    Applied during RL stage as:
+    total_loss = policy_loss - entropy_coef * entropy
     """
     
     # === L1 Warmstart Configuration ===
     use_l1_warmstart: bool = True
-    """Enable L1 warmstart before transitioning to tokenized RL.
-    When enabled, training proceeds in phases:
+    """Enable L1 warmstart before tokenized RL.
+    When enabled, training proceeds in two stages:
     1. Warmup (0-l1_warmup_steps): Execute L1 actions, train tokenized to match (behavior cloning)
-    2. Transition (warmup_steps to warmup_steps+transition_steps): Gradually shift to tokenized
-    3. RL (after transition): Execute tokenized actions, train with true PPO
+    2. RL (after warmup): Execute tokenized actions, train with PPO
     
-    This prevents the tokenized head from learning poorly initially and enables
-    true reinforcement learning once the tokenized policy is competent.
+    Stage boundaries are locked per rollout+update cycle to avoid mixed-policy batches.
     """
     
     l1_warmup_steps: int = 25000
@@ -195,20 +194,31 @@ class PPOConfig:
     - 0: Skip warmup (not recommended, tokenized starts from scratch)
     """
     
-    l1_transition_steps: int = 10000
-    """Number of steps for gradual transition from L1 to tokenized actions.
-    Uses epsilon-greedy policy:
-    - Start of transition: 100% L1, 0% tokenized
-    - Middle: 50% L1, 50% tokenized
-    - End: 0% L1, 100% tokenized
+    l1_warmup_max_steps: int = 32000
+    """Safety cap for warmup stage.
     
-    This prevents catastrophic forgetting and ensures smooth handoff.
-    Expected tokenized success rate during transition: 40% → 50%
+    Warmup exits immediately at this step count even if competence gate has not
+    passed yet. Set <= 0 to disable the cap.
+    """
+
+    l1_warmup_success_threshold: float = 0.40
+    """Rolling tokenized success threshold required to unlock RL stage.
     
-    Recommended values:
-    - 5000: Standard transition
-    - 10000: Slower transition for stability
-    - 0: Immediate switch (may cause performance drop)
+    Example: 0.40 means at least 40% rolling tokenized success before handoff.
+    """
+
+    l1_warmup_success_window: int = 3
+    """Number of recent validations used for rolling tokenized success."""
+
+    l1_warmup_required_consecutive: int = 2
+    """Required consecutive validations where rolling success >= threshold."""
+
+    l1_warmup_overclone_threshold: float = 0.85
+    """Optional anti-overcloning guard.
+    
+    If rolling tokenized success reaches this value after min warmup steps,
+    warmup exits immediately to preserve RL exploration headroom.
+    Set >1.0 to effectively disable.
     """
     
     value_loss_coef: float = 0.5
@@ -303,31 +313,25 @@ class PPOConfig:
     # Logging and Checkpointing
     # ===========================================
     
-    checkpoint_dir: str = "/home/abhi/Documents/Deep-RL/OpenVLA-OFT-RL/checkpoints"
+    checkpoint_dir: str = "checkpoints"
     """Directory to save model checkpoints.
     
     Checkpoints include:
-    - Periodic: checkpoint_stage_{stage}_update_{update}_step_{step}.pt
-    - Best: best_model_stage_{stage}_success_{rate}.pt
-    - Final: final_model_step_{step}.pt
+    - Latest per stage (rolling): latest_model_stage_{stage}.pt
+    - Best per stage: best_model_stage_{stage}.pt
     
     Default: "checkpoints" (relative to working directory)
     Can be absolute path: "/path/to/checkpoints"
     """
     
     save_interval: int = 5
-    """Save checkpoint every N policy updates.
+    """Deprecated for checkpoint writes.
     
-    Checkpoints are saved with naming pattern:
-    checkpoint_stage_{stage}_update_{update}_step_{step}.pt
+    Checkpoint policy now avoids interval-based saves and keeps only:
+    - best_model_stage_{stage}.pt
+    - latest_model_stage_{stage}.pt
     
-    Additionally, the best model (highest tokenized success rate) is saved as:
-    best_model_stage_{stage}_success_{rate}.pt
-    
-    The final model at training completion is saved as:
-    final_model_step_{step}.pt
-    
-    Default: 5 (save every 5 policy updates)
+    This field is retained for backward compatibility with prior configs/logs.
     """
     
     use_wandb: bool = True
@@ -395,6 +399,9 @@ class PPOConfig:
     OpenVLA is trained on 224x224 images.
     Do not change unless retraining vision backbone.
     """
+
+    seed: int = 0
+    """Random seed used for environment creation and training reproducibility."""
     
     # ===========================================
     # Device Configuration

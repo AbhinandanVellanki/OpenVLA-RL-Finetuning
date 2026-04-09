@@ -694,6 +694,16 @@ def main():
     )
     
     args = parser.parse_args()
+    gpu_id = 0
+    if args.device.startswith("cuda:"):
+        try:
+            gpu_id = int(args.device.split(":", maxsplit=1)[1])
+        except ValueError:
+            raise ValueError(f"Invalid --device format: {args.device}. Expected cuda:<id> or cpu.")
+    elif args.device == "cpu":
+        gpu_id = -1
+    else:
+        raise ValueError(f"Invalid --device value: {args.device}. Expected cuda:<id> or cpu.")
     
     # VLA configuration - defaults match reference run_libero_eval.py
     # Reference uses: use_l1_regression=True (equivalent to our load_l1_action_head=True)
@@ -703,8 +713,8 @@ def main():
         freeze_l1_action_head=True,
         use_tokenized_actions=args.use_tokenized_actions,  # False by default (matches reference)
         num_images_in_input=2,  # Required: model expects 2 cameras
-        use_multi_gpu=False,  # Single GPU for evaluation
-        gpu_id=0,  # Use GPU 0 for single-GPU evaluation
+        use_data_parallel=False,  # Single-device eval by default
+        gpu_id=gpu_id,
     )
     
     # Override checkpoint if provided

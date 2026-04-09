@@ -1,128 +1,144 @@
 #!/usr/bin/env python3
 """
-Test script to verify L1 warmstart → RL transition logic.
-Simulates training progression and validates phase transitions.
+Sanity tests for warmup -> RL handoff logic.
+
+Covers:
+- stage locking per update
+- competence gate (rolling tokenized success threshold)
+- max warmup safety cap
+- anti-overclone guard
 """
 
-import numpy as np
+from collections import deque
 
-class WarmstartTest:
-    def __init__(self, l1_warmup_steps=25000, l1_transition_steps=5000):
-        self.l1_warmup_steps = l1_warmup_steps
-        self.l1_transition_steps = l1_transition_steps
+
+class WarmstartGateTest:
+    def __init__(
+        self,
+        min_steps=25000,
+        max_steps=32000,
+        success_threshold=0.40,
+        success_window=3,
+        required_consecutive=2,
+        overclone_threshold=0.85,
+        rollout_steps=512,
+    ):
         self.use_l1_warmstart = True
-    
-    def _should_use_l1_actions(self, global_step):
-        """Determine whether to use L1 or tokenized actions."""
-        if not self.use_l1_warmstart:
-            return False
-        
-        if global_step < self.l1_warmup_steps:
-            return True  # Warmup
-        elif global_step < self.l1_warmup_steps + self.l1_transition_steps:
-            # Transition: epsilon-greedy
-            progress = (global_step - self.l1_warmup_steps) / self.l1_transition_steps
-            epsilon = 1.0 - progress
-            return np.random.rand() < epsilon
+        self.min_steps = min_steps
+        self.max_steps = max_steps
+        self.success_threshold = success_threshold
+        self.success_window = success_window
+        self.required_consecutive = required_consecutive
+        self.overclone_threshold = overclone_threshold
+        self.rollout_steps = rollout_steps
+
+        self.global_step = 0
+        self.training_stage = "warmup" if self.use_l1_warmstart and self.min_steps > 0 else "rl"
+        self.success_history = deque(maxlen=max(1, self.success_window))
+        self.consecutive_hits = 0
+        self.rolling_success = None
+
+    def _should_use_l1_actions(self, stage):
+        return self.use_l1_warmstart and stage == "warmup"
+
+    def _update_gate(self, tokenized_success_rate):
+        self.success_history.append(float(tokenized_success_rate))
+        self.rolling_success = sum(self.success_history) / len(self.success_history)
+
+        if self.global_step < self.min_steps:
+            self.consecutive_hits = 0
+            return
+        if len(self.success_history) < max(1, self.success_window):
+            self.consecutive_hits = 0
+            return
+
+        if self.rolling_success >= self.success_threshold:
+            self.consecutive_hits += 1
         else:
-            return False  # RL phase
-    
-    def _get_rollout_policy_name(self, global_step):
-        """Get human-readable policy name."""
+            self.consecutive_hits = 0
+
+    def _should_exit_warmup(self):
+        if self.global_step < self.min_steps:
+            return False, "min_warmup_not_met"
+        if self.max_steps > 0 and self.global_step >= self.max_steps:
+            return True, "max_warmup_steps"
+        if self.rolling_success is not None and self.overclone_threshold <= 1.0 and self.rolling_success >= self.overclone_threshold:
+            return True, "overclone_guard"
+        if self.consecutive_hits >= max(1, self.required_consecutive):
+            return True, "competence_gate"
+        return False, "competence_pending"
+
+    def _determine_stage(self):
         if not self.use_l1_warmstart:
-            return "Tokenized (RL)"
-        
-        if global_step < self.l1_warmup_steps:
-            return "L1 (warmup)"
-        elif global_step < self.l1_warmup_steps + self.l1_transition_steps:
-            progress = (global_step - self.l1_warmup_steps) / self.l1_transition_steps
-            return f"L1→Tokenized ({progress:.0%})"
-        else:
-            return "Tokenized (RL)"
-    
-    def test_phase_transitions(self):
-        """Test that phase transitions work correctly."""
-        print("=" * 60)
-        print("Testing L1 Warmstart → RL Transition Logic")
-        print("=" * 60)
-        
-        # Test checkpoints
-        test_steps = [
-            0,          # Start of warmup
-            12500,      # Mid-warmup
-            24999,      # End of warmup
-            25000,      # Start of transition
-            27500,      # Mid-transition
-            29999,      # End of transition
-            30000,      # Start of RL
-            50000,      # Mid-RL
-            100000,     # Late RL
-        ]
-        
-        print("\n📊 Phase Transitions:")
-        print("-" * 60)
-        for step in test_steps:
-            policy_name = self._get_rollout_policy_name(step)
-            uses_l1 = self._should_use_l1_actions(step)
-            
-            # Determine phase
-            if step < self.l1_warmup_steps:
-                phase = "WARMUP"
-            elif step < self.l1_warmup_steps + self.l1_transition_steps:
-                phase = "TRANSITION"
-            else:
-                phase = "RL"
-            
-            print(f"Step {step:6d} | {phase:11s} | {policy_name:20s} | Uses L1: {uses_l1}")
-        
-        # Test transition statistics
-        print("\n📈 Transition Statistics:")
-        print("-" * 60)
-        
-        # Sample 1000 steps during transition
-        transition_start = self.l1_warmup_steps
-        transition_samples = []
-        for _ in range(1000):
-            step = np.random.randint(transition_start, transition_start + self.l1_transition_steps)
-            uses_l1 = self._should_use_l1_actions(step)
-            transition_samples.append(int(uses_l1))
-        
-        l1_ratio = np.mean(transition_samples)
-        print(f"Average L1 usage during transition: {l1_ratio:.1%}")
-        print(f"Expected: ~50% (due to epsilon-greedy)")
-        
-        # Verify phase boundaries
-        print("\n✅ Phase Boundary Verification:")
-        print("-" * 60)
-        
-        # Warmup: should always use L1
-        warmup_samples = [self._should_use_l1_actions(step) for step in range(0, self.l1_warmup_steps, 1000)]
-        assert all(warmup_samples), "❌ FAIL: Not all warmup steps use L1"
-        print("✓ Warmup phase: All steps use L1")
-        
-        # RL: should never use L1
-        rl_start = self.l1_warmup_steps + self.l1_transition_steps
-        rl_samples = [self._should_use_l1_actions(step) for step in range(rl_start, rl_start + 10000, 1000)]
-        assert not any(rl_samples), "❌ FAIL: Some RL steps still use L1"
-        print("✓ RL phase: No steps use L1")
-        
-        # Transition: should have mix
-        transition_ratio = np.mean(transition_samples)
-        assert 0.3 < transition_ratio < 0.7, f"❌ FAIL: Transition ratio {transition_ratio:.2%} not balanced"
-        print(f"✓ Transition phase: Balanced L1/Tokenized mix ({transition_ratio:.1%})")
-        
-        print("\n" + "=" * 60)
-        print("✅ All tests passed!")
-        print("=" * 60)
+            return "rl"
+        if self.training_stage == "rl":
+            return "rl"
+        should_exit, _ = self._should_exit_warmup()
+        return "rl" if should_exit else "warmup"
+
+    def _lock_stage_for_update(self):
+        return self._determine_stage()
+
+    def test_stage_locking(self):
+        print("\n[1/4] Stage locking check")
+        self.global_step = max(self.min_steps - (self.rollout_steps // 2), 0)
+        locked_stage = self._lock_stage_for_update()
+        assert locked_stage == "warmup"
+        assert self._should_use_l1_actions(locked_stage)
+
+        # Rollout crosses min boundary, but stage remains warmup for this update.
+        self.global_step += self.rollout_steps
+        next_stage = self._lock_stage_for_update()
+        # Still warmup because competence gate is not passed yet.
+        assert next_stage == "warmup"
+        print("✓ Stage lock behavior is correct")
+
+    def test_competence_gate(self):
+        print("[2/4] Competence gate check")
+        self.global_step = self.min_steps
+        self.training_stage = "warmup"
+        self.success_history.clear()
+        self.consecutive_hits = 0
+        self.rolling_success = None
+
+        # Sequence yields rolling means >= 0.40 for two consecutive validations:
+        # [0.31, 0.42, 0.50] -> 0.41 (hit 1), then [0.42, 0.50, 0.45] -> 0.456... (hit 2)
+        for success in [0.31, 0.42, 0.50, 0.45]:
+            self._update_gate(success)
+
+        should_exit, reason = self._should_exit_warmup()
+        assert should_exit and reason == "competence_gate"
+        self.training_stage = self._determine_stage()
+        assert self.training_stage == "rl"
+        print("✓ Competence gate triggers warmup exit")
+
+    def test_max_warmup_cap(self):
+        print("[3/4] Max warmup cap check")
+        self.global_step = self.max_steps
+        self.training_stage = "warmup"
+        self.success_history.clear()
+        self.consecutive_hits = 0
+        self.rolling_success = 0.10
+        should_exit, reason = self._should_exit_warmup()
+        assert should_exit and reason == "max_warmup_steps"
+        print("✓ Max warmup safety cap works")
+
+    def test_overclone_guard(self):
+        print("[4/4] Overclone guard check")
+        self.global_step = self.min_steps
+        self.training_stage = "warmup"
+        self.success_history.clear()
+        self.consecutive_hits = 0
+        self.rolling_success = self.overclone_threshold + 0.01
+        should_exit, reason = self._should_exit_warmup()
+        assert should_exit and reason == "overclone_guard"
+        print("✓ Overclone guard works")
+
 
 if __name__ == "__main__":
-    # Test default configuration
-    tester = WarmstartTest(l1_warmup_steps=25000, l1_transition_steps=5000)
-    tester.test_phase_transitions()
-    
-    print("\n\n")
-    
-    # Test extended warmup configuration
-    print("Testing Extended Warmup Configuration:")
-    tester_extended = WarmstartTest(l1_warmup_steps=50000, l1_transition_steps=10000)
-    tester_extended.test_phase_transitions()
+    tester = WarmstartGateTest()
+    tester.test_stage_locking()
+    tester.test_competence_gate()
+    tester.test_max_warmup_cap()
+    tester.test_overclone_guard()
+    print("\n✅ Warmup handoff tests passed")
